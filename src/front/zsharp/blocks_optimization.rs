@@ -1514,6 +1514,14 @@ fn tta_inst<'ast, const IN_BRANCH: bool>(
                 }
                 new_instr.push(BlockContent::Branch((cond.clone(), new_if_inst, new_else_inst)));
             }
+            BlockContent::Load((var, _, _, _, _)) => {
+                gen_set.insert(var.clone());
+                new_instr.push(i.clone());
+            }
+            BlockContent::MemPop((var, _, _)) => {
+                gen_set.insert(var.clone());
+                new_instr.push(i.clone());
+            }
             _ => { new_instr.push(i.clone()); }
         }
     }
@@ -1645,13 +1653,14 @@ impl<'ast> ZGen<'ast> {
 
     // Returns: blks, entry_bl, input_liveness
     // Inputs are (variable, type) pairs
-    pub fn optimize_block<const VERBOSE: bool>(
+    pub fn optimize_block(
         &self,
         mut bls: Vec<Block<'ast>>,
         mut entry_bl: usize,
         mut inputs: Vec<(String, Ty)>,
         // When no_opt is set, DO NOT perform Merge / Spilling
         no_opt: bool,
+        VERBOSE: bool,
     ) -> (Vec<Block<'ast>>, usize, Vec<bool>) {
         println!("\n\n--\nOptimization:");
         // Add %SP and %AS to program input
@@ -3368,10 +3377,11 @@ impl<'ast> ZGen<'ast> {
     // Inputs are (variable, type) pairs
     //  MODE = 0 - Verification Mode, output registers are witnesses and checked using assertion
     //  MODE = 1 - Compute Mode, output registers are assigned and not checked
-    pub fn process_block<const VERBOSE: bool, const MODE: usize>(
+    pub fn process_block<const MODE: usize>(
         &self,
         bls: Vec<Block<'ast>>,
-        entry_bl: usize
+        entry_bl: usize,
+        VERBOSE: bool,
     ) -> (Vec<Block<'ast>>, usize, usize, usize, Vec<(Vec<usize>, Vec<usize>)>, Vec<(usize, usize)>, Vec<Vec<usize>>) {
         println!("\n\n--\nPost-Processing:");
         // Construct a new CFG for the program

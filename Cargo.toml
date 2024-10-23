@@ -48,7 +48,7 @@ petgraph = { version = "0.6", optional = true }
 spartan = { version = "0.8", default-features = false, optional = true }
 spartan_parallel = { path = "../spartan_parallel", default-features = false, features = ["multicore", "profile"] }
 merlin = { version = "3.0.0" }
-curve25519-dalek = { version = "3.2.0", features = ["serde"], optional = true }
+curve25519-dalek = { version = "3.2.1", features = ["serde"], optional = true }
 # TODO: kill
 paste = "1.0"
 im = "15"

@@ -166,7 +166,7 @@ name = "bellman"
 version = "0.13.1"
 source = "git+https://github.com/alex-ozdemir/bellman.git?branch=mirage#94b292b20bcef1db9d8ee1704a93cd4920088388"
 dependencies = [
- "bitvec",
+ "bitvec 1.0.1",
  "blake2s_simd",
  "byteorder",
  "crossbeam-channel",
@@ -220,7 +220,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1bc2832c24239b0141d5674bb9174f9d68a8b5b3f2753311927c172ca46f7e9c"
 dependencies = [
  "funty",
- "radium",
+ "radium 0.7.0",
+ "tap",
+ "wyz",
+]
+
+[[package]]
+name = "bitvec"
+version = "1.1.0"
+dependencies = [
+ "funty",
+ "radium 0.7.1",
  "tap",
  "wyz",
 ]
@@ -680,7 +690,7 @@ checksum = "6999dc1837253364c2ebb0704ba97994bd874e8f195d665c50b7548f6ea92764"
 name = "ff"
 version = "0.12.2"
 dependencies = [
- "bitvec",
+ "bitvec 1.1.0",
  "byteorder",
  "ff_derive 0.12.2",
  "rand_core 0.6.4",
@@ -1280,6 +1290,10 @@ name = "radium"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
+
+[[package]]
+name = "radium"
+version = "0.7.1"
 
 [[package]]
 name = "rand"

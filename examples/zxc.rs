@@ -10,8 +10,7 @@ use bellman::Circuit;
 use bls12_381::{Bls12, Scalar};
 */
 const PRINT_PROOF: bool = false;
-const INLINE_SPARTAN_PROOF: bool = false;
-const TOTAL_NUM_VARS_BOUND: usize = 100000000;
+const TOTAL_NUM_VARS_BOUND: usize = 10000000000;
 
 use core::cmp::min;
 use rug::Integer;
@@ -92,6 +91,14 @@ struct Options {
     #[arg(long = "no_opt")]
     /// skip all block-level optimizations
     no_opt: bool,
+
+    #[arg(long = "verbose_opt")]
+    /// print results of every optimization pass
+    verbose_opt: bool,
+
+    #[arg(long = "inline_spartan")]
+    /// automatically execute Spartan
+    inline_spartan: bool,
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, ValueEnum)]
@@ -537,7 +544,8 @@ fn get_compile_time_knowledge<const VERBOSE: bool>(
         let inputs = zsharp::Inputs {
             file: path.clone(),
             mode: Mode::Proof,
-            no_opt: options.no_opt
+            no_opt: options.no_opt,
+            verbose_opt: options.verbose_opt
         };
         ZSharpFE::gen(inputs)
     };
@@ -793,7 +801,8 @@ fn get_run_time_knowledge<const VERBOSE: bool>(
         let inputs = zsharp::Inputs {
             file: path,
             mode: Mode::Proof,
-            no_opt: options.no_opt
+            no_opt: options.no_opt,
+            verbose_opt: options.verbose_opt
         };
 
         ZSharpFE::interpret(inputs, &entry_regs, &entry_stacks, &entry_arrays, &entry_witnesses)
@@ -1405,7 +1414,7 @@ fn main() {
         ctk.write_to_file(benchmark_name.to_string()).unwrap();
         rtk.write_to_file(benchmark_name.to_string()).unwrap();
     }
-    if !INLINE_SPARTAN_PROOF {
+    if !options.inline_spartan {
         // --
         // Write CTK, RTK to file
         // --

@@ -33,7 +33,6 @@ use zvisit::{ZConstLiteralRewriter, ZGenericInf, ZStatementWalker, ZVisitorMut};
 
 // garbage collection increment for adaptive GC threshold
 const GC_INC: usize = 32;
-const GEN_VERBOSE: bool = false;
 const INTERPRET_VERBOSE: bool = false;
 
 /// Inputs to the Z# compiler
@@ -44,6 +43,8 @@ pub struct Inputs {
     pub mode: Mode,
     /// If true, do not perform block-level optimizations
     pub no_opt: bool,
+    /// Print results of every optimization pass
+    pub verbose_opt: bool,
 }
 
 /// The Z# front-end. Implements [FrontEnd].
@@ -69,9 +70,9 @@ impl FrontEnd for ZSharpFE {
             b.pretty();
             println!("");
         }
-        let (blks, entry_bl, input_liveness) = g.optimize_block::<GEN_VERBOSE>(blks, entry_bl, inputs, i.no_opt);
+        let (blks, entry_bl, input_liveness) = g.optimize_block(blks, entry_bl, inputs, i.no_opt, i.verbose_opt);
         let (blks, _, io_size, _, live_io_list, num_mem_accesses, live_vm_list) = 
-            g.process_block::<GEN_VERBOSE, 0>(blks, entry_bl);
+            g.process_block::<0>(blks, entry_bl, i.verbose_opt);
         // NOTE: The input of block 0 includes %BN, which should be removed when reasoning about function input
         let func_input_width = blks[0].get_num_inputs() - 1;
         println!("\n\n--\nCirc IR:");
@@ -112,8 +113,8 @@ impl ZSharpFE {
         g.generics_stack_push(HashMap::new());
         
         let (blks, entry_bl, inputs) = g.bl_gen_entry_fn("main");
-        let (blks, entry_bl, input_liveness) = g.optimize_block::<INTERPRET_VERBOSE>(blks, entry_bl, inputs.clone(), i.no_opt);
-        let (blks, entry_bl, io_size, _, _, _, _) = g.process_block::<INTERPRET_VERBOSE, 1>(blks, entry_bl);
+        let (blks, entry_bl, input_liveness) = g.optimize_block(blks, entry_bl, inputs.clone(), i.no_opt, INTERPRET_VERBOSE);
+        let (blks, entry_bl, io_size, _, _, _, _) = g.process_block::<1>(blks, entry_bl, INTERPRET_VERBOSE);
 
         println!("\n\n--\nInterpretation:");
         let (
