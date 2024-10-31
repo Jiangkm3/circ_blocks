@@ -194,38 +194,6 @@ impl<'ast> ZGen<'ast> {
         Ok(val)
     }
 
-    fn reg_name_to_index(&self, name: &str) -> Result<usize, String> {
-        let name_bytes = name.as_bytes();
-        match name_bytes[1] {
-            b'i' | b'o' | b'w' => {
-                let reg_index: usize = name.split_at(2).1.parse().or(Err(format!("Unknown register: {}", name)))?;
-                Ok(reg_index)
-            },
-            _ => {
-                Err(format!("Unknown register: {}", name))
-            }
-        }
-    }
-
-    // Convert a usize into a Field value
-    fn usize_to_field(&self, val: usize) -> Result<T, String> {
-        let e = &(LiteralExpression::DecimalLiteral(
-            DecimalLiteralExpression {
-                value: DecimalNumber {
-                    value: val.to_string(),
-                    span: Span::new("", 0, 0).unwrap()
-                },
-                suffix: Some(DecimalSuffix::Field(FieldSuffix {
-                        span: Span::new("", 0, 0).unwrap()
-                    })),
-                span: Span::new("", 0, 0).unwrap()
-            }
-        ));
-
-        self.literal_(&e)
-    }
-
-
     // I am hacking cvars_stack to do the interpretation. Ideally we want a separate var_table to do so.
     // We only need BTreeMap<String, T> to finish evaluation, so the 2 Vecs of cvars_stack should always have
     // size 1, i.e. we use only one function and one scope.
@@ -264,9 +232,8 @@ impl<'ast> ZGen<'ast> {
         // bl_exec_state[i]: execution state of each block-execution
         let mut bl_exec_state: Vec<ExecState> = Vec::new();
 
+        self.cvar_enter_function();
         let mut nb = entry_bl;
-        let mut io_regs: Vec<Option<T>> = Vec::new();
-        let mut wit_regs: Vec<Option<T>> = Vec::new();
         let mut phy_mem: Vec<Option<T>> = Vec::new();
         let mut vir_mem: Vec<Option<T>> = Vec::new();
         let mut terminated = false;
@@ -303,7 +270,11 @@ impl<'ast> ZGen<'ast> {
                     if *alive {
                         let (name, _) = &bls[entry_bl].inputs[input_count];
                         let val = self.int_to_t(&entry_regs[i], &x)?;
-                        self.bl_eval_assign_impl_(&mut io_regs, &mut wit_regs, name, val)?;
+                        self.declare_init_impl_::<true>(
+                            name.to_string(),
+                            x.clone(),
+                            val,
+                        )?;
                         input_count += 1;
                     }
                 },
@@ -317,7 +288,11 @@ impl<'ast> ZGen<'ast> {
                         let (name, _) = &bls[entry_bl].inputs[input_count];
                         // Declare the array as a pointer
                         let val = self.int_to_t(&entry_regs[i], &Ty::Field)?;
-                        self.bl_eval_assign_impl_(&mut io_regs, &mut wit_regs, name, val)?;
+                        self.declare_init_impl_::<true>(
+                            name.to_string(),
+                            Ty::Field,
+                            val,
+                        )?;
                         input_count += 1;
                     }
                     // Add all entries as STOREs
@@ -362,59 +337,78 @@ impl<'ast> ZGen<'ast> {
             // If it is the first block, add input to prog_reg_in
             if tr_size == 0 {
                 for i in 1..io_size {
-                    prog_reg_in[i] = self.bl_eval_identifier_impl_(&io_regs, &wit_regs, &format!("%i{:06}", i)).ok();
+                    prog_reg_in[i] = self.cvar_lookup(&format!("%i{:06}", i));
                 }
             }
-            // Block transition is largely free, unless an input is not defined in the previous output, 
-            // then set it to 0 / false
+            // If not the first block, redefine output of the last block as input to this block
+            // If an input is not defined in the previous output, then set it to 0 / false
             // Record the transition state
             else {
                 for (name, ty) in &bls[nb].inputs {
                     if let Some(x) = ty {
-                        if self.bl_eval_identifier_impl_(&io_regs, &wit_regs, name).is_err() {
-                            let lit = match x {
-                                Ty::Bool => {
-                                    LiteralExpression::BooleanLiteral(BooleanLiteralExpression {
-                                        value: "false".to_string(),
-                                        span: Span::new("", 0, 0).unwrap()
-                                    })
-                                },
-                                _ => {
-                                    LiteralExpression::DecimalLiteral(DecimalLiteralExpression {
-                                        value: DecimalNumber {
-                                            value: "0".to_string(),
+                        let output_name = str::replace(name, "i", "o");
+                        let val = self.cvar_lookup(&output_name).unwrap_or_else( ||
+                            self.expr_impl_::<true>(&Expression::Literal(
+                                match x {
+                                    Ty::Bool => {
+                                        LiteralExpression::BooleanLiteral(BooleanLiteralExpression {
+                                            value: "false".to_string(),
                                             span: Span::new("", 0, 0).unwrap()
-                                        },
-                                        suffix: Some(match x {
-                                            Ty::Field => DecimalSuffix::Field(FieldSuffix {
+                                        })
+                                    },
+                                    _ => {
+                                        LiteralExpression::DecimalLiteral(DecimalLiteralExpression {
+                                            value: DecimalNumber {
+                                                value: "0".to_string(),
                                                 span: Span::new("", 0, 0).unwrap()
+                                            },
+                                            suffix: Some(match x {
+                                                Ty::Field => DecimalSuffix::Field(FieldSuffix {
+                                                    span: Span::new("", 0, 0).unwrap()
+                                                }),
+                                                Ty::Uint(64) => DecimalSuffix::U64(U64Suffix {
+                                                    span: Span::new("", 0, 0).unwrap()
+                                                }),
+                                                Ty::Uint(32) => DecimalSuffix::U32(U32Suffix {
+                                                    span: Span::new("", 0, 0).unwrap()
+                                                }),
+                                                Ty::Uint(16) => DecimalSuffix::U16(U16Suffix {
+                                                    span: Span::new("", 0, 0).unwrap()
+                                                }),
+                                                Ty::Uint(8) => DecimalSuffix::U8(U8Suffix {
+                                                    span: Span::new("", 0, 0).unwrap()
+                                                }),
+                                                _ => panic!("Unsupported input type: {:?}!", x)
                                             }),
-                                            Ty::Uint(64) => DecimalSuffix::U64(U64Suffix {
-                                                span: Span::new("", 0, 0).unwrap()
-                                            }),
-                                            Ty::Uint(32) => DecimalSuffix::U32(U32Suffix {
-                                                span: Span::new("", 0, 0).unwrap()
-                                            }),
-                                            Ty::Uint(16) => DecimalSuffix::U16(U16Suffix {
-                                                span: Span::new("", 0, 0).unwrap()
-                                            }),
-                                            Ty::Uint(8) => DecimalSuffix::U8(U8Suffix {
-                                                span: Span::new("", 0, 0).unwrap()
-                                            }),
-                                            _ => panic!("Unsupported input type: {:?}!", x)
-                                        }),
-                                        span: Span::new("", 0, 0).unwrap()
-                                    })
+                                            span: Span::new("", 0, 0).unwrap()
+                                        })
+                                    }
                                 }
-                            };
-                            let val = self.literal_(&lit).unwrap();
-                            self.bl_eval_assign_impl_(&mut io_regs, &mut wit_regs, name, val)?;
-                        }
+                            )).unwrap()
+                        );
+                        self.declare_init_impl_::<true>(
+                            name.to_string(),
+                            match x {
+                                Ty::Uint(_) | Ty::Field | Ty::Bool => { x.clone() },
+                                Ty::Array(..) => { Ty::Field },
+                                _ => { unreachable!() }
+                            },
+                            val,
+                        )?;
                     }
                 }
                 // Record the last transition state as the union of reg_in and reg_out
                 for i in 1..io_size {
-                    bl_exec_state[tr_size - 1].reg_out[i] = self.bl_eval_identifier_impl_(&io_regs, &wit_regs, &format!("%o{:06}", i)).ok();
+                    bl_exec_state[tr_size - 1].reg_out[i] = self.cvar_lookup(&format!("%o{:06}", i));
+                    if bl_exec_state[tr_size - 1].reg_out[i].is_none() {
+                        bl_exec_state[tr_size - 1].reg_out[i] = self.cvar_lookup(&format!("%i{:06}", i));
+                    }
+                }
+                // Remove all %o registers from the previous block (if exist)
+                if bl_exec_state.len() > 1 {
+                    for (name, _) in &bls[bl_exec_state[bl_exec_state.len() - 2].blk_id].outputs {
+                        self.cvar_remove(name);
+                    }
                 }
             }
 
@@ -449,8 +443,7 @@ impl<'ast> ZGen<'ast> {
             let phy_mem_op: Vec<MemOp>;
             let vir_mem_op: Vec<MemOp>;
             let wit_op: Vec<T>;
-            (nb, terminated, phy_mem_op, vir_mem_op, wit_op, witness_count) = 
-                self.bl_eval_impl_(&bls[nb], &mut io_regs, &mut wit_regs, &mut phy_mem, &mut vir_mem, entry_witnesses, witness_count)?;
+            (nb, phy_mem, vir_mem, terminated, phy_mem_op, vir_mem_op, wit_op, witness_count) = self.bl_eval_impl_(&bls[nb], phy_mem, vir_mem, entry_witnesses, witness_count)?;
             // Update successor block ID
             bl_exec_state[tr_size].succ_id = nb;
             // Update Memory Op
@@ -462,16 +455,34 @@ impl<'ast> ZGen<'ast> {
         
         // Record the final transition state
         for i in 1..io_size {
-            bl_exec_state[tr_size - 1].reg_out[i] = self.bl_eval_identifier_impl_(&io_regs, &wit_regs, &format!("%o{:06}", i)).ok();
+            bl_exec_state[tr_size - 1].reg_out[i] = self.cvar_lookup(&format!("%o{:06}", i));
         }
         // Return value is just the value of the variable called "%RET"
         // Type of return value is checked during assignment
-        let ret = self.bl_eval_identifier_impl_(&io_regs, &wit_regs, O_RET).or(
-            Err(format!("Missing return value for one or more functions."))
-        );
+        let ret = self.cvar_lookup(O_RET).ok_or(format!(
+            "Missing return value for one or more functions."
+        ));
 
         let (phy_mem_list, vir_mem_list) = sort_by_mem(&init_phy_mem_list, &init_vir_mem_list, &bl_exec_state);
         Ok((ret?, bl_exec_count, prog_reg_in, bl_exec_state, init_phy_mem_list, init_vir_mem_list, phy_mem_list, vir_mem_list))
+    }
+
+    // Convert a usize into a Field value
+    fn usize_to_field(&self, val: usize) -> Result<T, String> {
+        let e = &(LiteralExpression::DecimalLiteral(
+            DecimalLiteralExpression {
+                value: DecimalNumber {
+                    value: val.to_string(),
+                    span: Span::new("", 0, 0).unwrap()
+                },
+                suffix: Some(DecimalSuffix::Field(FieldSuffix {
+                        span: Span::new("", 0, 0).unwrap()
+                    })),
+                span: Span::new("", 0, 0).unwrap()
+            }
+        ));
+
+        self.literal_(&e)
     }
 
     // Return type:
@@ -484,13 +495,11 @@ impl<'ast> ZGen<'ast> {
     fn bl_eval_impl_(
         &self, 
         bl: &Block<'ast>,
-        io_regs: &mut Vec<Option<T>>,
-        wit_regs: &mut Vec<Option<T>>,
-        phy_mem: &mut Vec<Option<T>>,
-        vir_mem: &mut Vec<Option<T>>,
+        mut phy_mem: Vec<Option<T>>,
+        mut vir_mem: Vec<Option<T>>,
         entry_witnesses: &Vec<Integer>,
         mut witness_count: usize,
-    ) -> Result<(usize, bool, Vec<MemOp>, Vec<MemOp>, Vec<T>, usize), String> {
+    ) -> Result<(usize, Vec<Option<T>>, Vec<Option<T>>, bool, Vec<MemOp>, Vec<MemOp>, Vec<T>, usize), String> {
         debug!("Block eval impl: {}", bl.name);
 
         // Record all RO mem ops before any PHY mem ops
@@ -499,36 +508,34 @@ impl<'ast> ZGen<'ast> {
         let mut vir_mem_op: Vec<MemOp> = Vec::new();
         let mut wit_op: Vec<T> = Vec::new();
 
-        witness_count = self.bl_eval_inst_impl_(io_regs, wit_regs, &bl.instructions, phy_mem, vir_mem, &mut phy_mem_op, &mut ro_mem_op, &mut vir_mem_op, &mut wit_op, entry_witnesses, witness_count)?;
+        (phy_mem, vir_mem, phy_mem_op, ro_mem_op, vir_mem_op, wit_op, witness_count) = self.bl_eval_inst_impl_(&bl.instructions, phy_mem, vir_mem, phy_mem_op, ro_mem_op, vir_mem_op, wit_op, entry_witnesses, witness_count)?;
         ro_mem_op.extend(phy_mem_op);
         let phy_mem_op = ro_mem_op;
 
         match &bl.terminator {
             BlockTerminator::Transition(e) => {
-                match self.t_to_usize(self.bl_eval_expr_impl_(io_regs, wit_regs, &e)?) {
-                    Ok(nb) => { return Ok((nb, false, phy_mem_op, vir_mem_op, wit_op, witness_count)); }, 
+                match self.t_to_usize(self.expr_impl_::<true>(&e)?) {
+                    Ok(nb) => { return Ok((nb, phy_mem, vir_mem, false, phy_mem_op, vir_mem_op, wit_op, witness_count)); }, 
                     _ => { return Err("Evaluation failed: block transition evaluated to an invalid block label".to_string()); }
                 }
             }
             BlockTerminator::FuncCall(fc) => Err(format!("Evaluation failed: function call to {} needs to be converted to block label.", fc)),
-            BlockTerminator::ProgTerm => Ok((0, true, phy_mem_op, vir_mem_op, wit_op, witness_count))
+            BlockTerminator::ProgTerm => Ok((0, phy_mem, vir_mem, true, phy_mem_op, vir_mem_op, wit_op, witness_count))
         }
     }
 
     fn bl_eval_inst_impl_(
         &self,
-        io_regs: &mut Vec<Option<T>>,
-        wit_regs: &mut Vec<Option<T>>,
         inst: &Vec<BlockContent>,
-        phy_mem: &mut Vec<Option<T>>,
-        vir_mem: &mut Vec<Option<T>>,
-        phy_mem_op: &mut Vec<MemOp>,
-        ro_mem_op: &mut Vec<MemOp>,
-        vir_mem_op: &mut Vec<MemOp>,
-        wit_op: &mut Vec<T>, 
+        mut phy_mem: Vec<Option<T>>,
+        mut vir_mem: Vec<Option<T>>,
+        mut phy_mem_op: Vec<MemOp>,
+        mut ro_mem_op: Vec<MemOp>,
+        mut vir_mem_op: Vec<MemOp>,
+        mut wit_op: Vec<T>, 
         entry_witnesses: &Vec<Integer>,
         mut witness_count: usize,
-    ) -> Result<usize, String> {
+    ) -> Result<(Vec<Option<T>>, Vec<Option<T>>, Vec<MemOp>, Vec<MemOp>, Vec<MemOp>, Vec<T>, usize), String> {
         for s in inst {
             debug!("Block eval inst impl: {:?}", s);
             match s {
@@ -536,37 +543,42 @@ impl<'ast> ZGen<'ast> {
                     if *alive {
                         let ty = if let Ty::Array(..) = ty { &Ty::Field } else { ty };
                         let val = self.int_to_t(&entry_witnesses[witness_count], &ty)?;
-                        self.bl_eval_assign_impl_(io_regs, wit_regs, var, val.clone())?;
+                        self.declare_init_impl_::<true>(
+                            var.to_string(),
+                            ty.clone(),
+                            val.clone(),
+                        )?;
                         wit_op.push(val);
                     }
                     witness_count += 1;
                 }
                 BlockContent::MemPush((var, _, offset)) => {
-                    let sp_t = self.bl_eval_identifier_impl_(io_regs, wit_regs, W_SP)?;
+                    let sp_t = self.cvar_lookup(W_SP).ok_or(format!("Push to %PHY failed: %SP is uninitialized."))?;
                     let sp = self.t_to_usize(sp_t)?;
                     if sp + offset != phy_mem.len() {
                         return Err(format!("Error processing %PHY push: index {sp} + {offset} does not match with stack size {}.", phy_mem.len()));
                     } else {
-                        let mut val_t = self.bl_eval_identifier_impl_(io_regs, wit_regs, var)?;
-                        phy_mem.push(Some(val_t.clone()));
-                        // Convert val_t to field for MemOp
-                        if val_t.type_() != &Ty::Field {
-                            val_t = uint_to_field(val_t).unwrap();
-                        }
-                        phy_mem_op.push(MemOp::new_phy(sp + offset, self.usize_to_field(sp + offset)?, val_t));
+                        let e = self.cvar_lookup(&var).ok_or(format!("Push to %PHY failed: pushing an out-of-scope variable: {}.", var))?;
+                        phy_mem.push(Some(e));
                     }
+                    // Convert val_t to field for MemOp
+                    let mut val_t = self.cvar_lookup(&var).unwrap();
+                    if val_t.type_() != &Ty::Field {
+                        val_t = uint_to_field(val_t).unwrap();
+                    }
+                    phy_mem_op.push(MemOp::new_phy(sp + offset, self.usize_to_field(sp + offset)?, val_t));
                 }
                 BlockContent::MemPop((var, _, offset)) => {
-                    let bp_t = self.bl_eval_identifier_impl_(io_regs, wit_regs, W_BP)?;
+                    let bp_t = self.cvar_lookup(W_BP).ok_or(format!("Pop from %PHY failed: %BP is uninitialized."))?;
                     let bp = self.t_to_usize(bp_t)?;
                     if bp + offset >= phy_mem.len() {
                         return Err(format!("Error processing %PHY pop: index out of bound."));
                     } else {
                         let t = phy_mem[bp + offset].clone();
-                        self.bl_eval_assign_impl_(io_regs, wit_regs, &var, t.unwrap())?;
+                        self.cvar_assign(&var, t.unwrap())?;
                     }
                     // Convert val_t to field for MemOp
-                    let mut val_t = self.bl_eval_identifier_impl_(io_regs, wit_regs, var)?;
+                    let mut val_t = self.cvar_lookup(&var).unwrap();
                     if val_t.type_() != &Ty::Field {
                         val_t = uint_to_field(val_t).unwrap();
                     }
@@ -575,25 +587,29 @@ impl<'ast> ZGen<'ast> {
                 BlockContent::ArrayInit((arr, _, len_expr, read_only)) => {
                     // Declare the array as a pointer (field), set to %SP or %AS
                     let pointer_t = if *read_only {
-                        self.bl_eval_identifier_impl_(io_regs, wit_regs, W_SP)?
+                        self.cvar_lookup(W_SP).ok_or(format!("Read-only array initialization failed: %SP is uninitialized."))?
                     } else {
-                        self.bl_eval_identifier_impl_(io_regs, wit_regs, W_AS)?
+                        self.cvar_lookup(W_AS).ok_or(format!("Array initialization failed: %AS is uninitialized."))?
                     };
-                    self.bl_eval_assign_impl_(io_regs, wit_regs, &arr, pointer_t.clone())?;
+                    self.declare_init_impl_::<true>(
+                        arr.to_string(),
+                        Ty::Field,
+                        pointer_t.clone(),
+                    )?;
                     // Increment %AS by size of array
-                    let mut len_t = self.bl_eval_expr_impl_(io_regs, wit_regs, &len_expr).unwrap();
+                    let mut len_t = self.expr_impl_::<true>(&len_expr).unwrap();
                     if len_t.type_() != &Ty::Field {
                         len_t = uint_to_field(len_t).unwrap();
                     }
                     let new_pointer_t = add(pointer_t, len_t).unwrap();
-                    self.bl_eval_assign_impl_(io_regs, wit_regs, if *read_only { W_SP } else { W_AS }, new_pointer_t)?;
+                    self.cvar_assign(if *read_only { W_SP } else { W_AS }, new_pointer_t)?;
                 }
                 BlockContent::Store((val_expr, _, arr, id_expr, init, read_only)) => {
-                    let mut val_t = self.bl_eval_expr_impl_(io_regs, wit_regs, &val_expr)?;
-                    let mut id_t = self.bl_eval_expr_impl_(io_regs, wit_regs, &id_expr)?;
+                    let mut val_t = self.expr_impl_::<true>(&val_expr)?;
+                    let mut id_t = self.expr_impl_::<true>(&id_expr)?;
 
                     // Add array offset to obtain address
-                    let offset_t = self.bl_eval_identifier_impl_(io_regs, wit_regs, arr)?;
+                    let offset_t = self.cvar_lookup(arr).ok_or(format!("Store failed: array {} is uninitialized.", arr))?;
                     if id_t.type_() != &Ty::Field {
                         id_t = uint_to_field(id_t).unwrap();
                     }
@@ -623,7 +639,7 @@ impl<'ast> ZGen<'ast> {
                         vir_mem[addr] = Some(val_t.clone());
 
                         // Update vir_mem_op
-                        let ls_t = self.bl_eval_expr_impl_(io_regs, wit_regs, &Expression::Literal(LiteralExpression::DecimalLiteral(DecimalLiteralExpression {
+                        let ls_t = self.expr_impl_::<false>(&Expression::Literal(LiteralExpression::DecimalLiteral(DecimalLiteralExpression {
                             value: DecimalNumber {
                                 value: STORE.to_string(),
                                 span: Span::new("", 0, 0).unwrap()
@@ -636,9 +652,9 @@ impl<'ast> ZGen<'ast> {
 
                         // %TS = %TS + 1
                         if !init {
-                            self.bl_eval_stmt_impl_(io_regs, wit_regs, &bl_gen_increment_stmt(W_TS, 1, &Ty::Field)).unwrap();
+                            self.bl_eval_stmt_impl_(&bl_gen_increment_stmt(W_TS, 1, &Ty::Field)).unwrap();
                         }
-                        let ts_t = self.bl_eval_identifier_impl_(io_regs, wit_regs, W_TS)?;
+                        let ts_t = self.cvar_lookup(W_TS).ok_or(format!("STORE failed: %TS is uninitialized."))?;
                         let ts = self.t_to_usize(ts_t.clone())?;
 
                         // Convert val_t to field for MemOp
@@ -655,11 +671,11 @@ impl<'ast> ZGen<'ast> {
                         ));
                     }
                 }
-                BlockContent::Load((var, _, arr, id_expr, read_only)) => {
-                    let mut id_t = self.bl_eval_expr_impl_(io_regs, wit_regs, &id_expr)?;
+                BlockContent::Load((var, ty, arr, id_expr, read_only)) => {
+                    let mut id_t = self.expr_impl_::<true>(&id_expr)?;
 
                     // Add array offset to obtain address
-                    let offset_t = self.bl_eval_identifier_impl_(io_regs, wit_regs, arr)?;
+                    let offset_t = self.cvar_lookup(arr).ok_or(format!("Store failed: array {} is uninitialized.", arr))?;
                     if id_t.type_() != &Ty::Field {
                         id_t = uint_to_field(id_t).unwrap();
                     }
@@ -672,8 +688,14 @@ impl<'ast> ZGen<'ast> {
                     } else {
                         vir_mem[addr].clone().ok_or(format!("LOAD failed: entry {} is uninitialized.", addr))?
                     };
-                    // Do not reason about typing
-                    self.bl_eval_assign_impl_(io_regs, wit_regs, var, val_t.clone())?;
+                    let entry_ty = val_t.type_();
+                    if ty != entry_ty {
+                        return Err(format!(
+                            "Assignment type mismatch: {} annotated vs {} actual",
+                            ty, entry_ty,
+                        ));
+                    }
+                    self.cvar_declare_init(var.clone(), ty, val_t.clone())?;
                     // Convert val_t to field for MemOp
                     if val_t.type_() != &Ty::Field {
                         val_t = uint_to_field(val_t).unwrap();
@@ -687,7 +709,7 @@ impl<'ast> ZGen<'ast> {
                             val_t,
                         ));
                     } else {
-                        let ls_t = self.bl_eval_expr_impl_(io_regs, wit_regs, &Expression::Literal(LiteralExpression::DecimalLiteral(DecimalLiteralExpression {
+                        let ls_t = self.expr_impl_::<false>(&Expression::Literal(LiteralExpression::DecimalLiteral(DecimalLiteralExpression {
                             value: DecimalNumber {
                                 value: LOAD.to_string(),
                                 span: Span::new("", 0, 0).unwrap()
@@ -696,8 +718,8 @@ impl<'ast> ZGen<'ast> {
                                 span: Span::new("", 0, 0).unwrap()
                             })),
                             span: Span::new("", 0, 0).unwrap()
-                        })))?;
-                        let ts_t = self.bl_eval_identifier_impl_(io_regs, wit_regs, W_TS)?;
+                        }))).unwrap();
+                        let ts_t = self.cvar_lookup(W_TS).ok_or(format!("STORE failed: %TS is uninitialized."))?;
                         let ts = self.t_to_usize(ts_t.clone())?;
     
                         vir_mem_op.push(MemOp::new_vir(
@@ -712,7 +734,7 @@ impl<'ast> ZGen<'ast> {
                 }
                 BlockContent::DummyLoad(read_only) => {
                     // Addr is 0
-                    let addr_t = self.bl_eval_expr_impl_(io_regs, wit_regs, &Expression::Literal(LiteralExpression::DecimalLiteral(DecimalLiteralExpression {
+                    let addr_t = self.expr_impl_::<false>(&Expression::Literal(LiteralExpression::DecimalLiteral(DecimalLiteralExpression {
                         value: DecimalNumber {
                             value: 0.to_string(),
                             span: Span::new("", 0, 0).unwrap()
@@ -721,7 +743,7 @@ impl<'ast> ZGen<'ast> {
                             span: Span::new("", 0, 0).unwrap()
                         })),
                         span: Span::new("", 0, 0).unwrap()
-                    })))?;
+                    }))).unwrap();
                     let addr = self.t_to_usize(addr_t.clone())?;
 
                     // Val is phy_mem[0] or vir_mem[0]
@@ -743,7 +765,7 @@ impl<'ast> ZGen<'ast> {
                             val_t,
                         ));
                     } else {
-                        let ls_t = self.bl_eval_expr_impl_(io_regs, wit_regs, &Expression::Literal(LiteralExpression::DecimalLiteral(DecimalLiteralExpression {
+                        let ls_t = self.expr_impl_::<false>(&Expression::Literal(LiteralExpression::DecimalLiteral(DecimalLiteralExpression {
                             value: DecimalNumber {
                                 value: LOAD.to_string(),
                                 span: Span::new("", 0, 0).unwrap()
@@ -753,7 +775,7 @@ impl<'ast> ZGen<'ast> {
                             })),
                             span: Span::new("", 0, 0).unwrap()
                         }))).unwrap();
-                        let ts_t = self.bl_eval_identifier_impl_(io_regs, wit_regs, W_TS)?;
+                        let ts_t = self.cvar_lookup(W_TS).ok_or(format!("STORE failed: %TS is uninitialized."))?;
                         let ts = self.t_to_usize(ts_t.clone())?;
     
                         vir_mem_op.push(MemOp::new_vir(
@@ -767,15 +789,15 @@ impl<'ast> ZGen<'ast> {
                     }
                 }
                 BlockContent::Branch((cond, if_inst, else_inst)) => {
-                    match self.bl_eval_expr_impl_(io_regs, wit_regs, &cond).and_then(|v| {
+                    match self.expr_impl_::<true>(&cond).and_then(|v| {
                         const_bool(v)
                             .ok_or_else(|| "interpreting expr as const bool failed".to_string())
                     }) {
                         Ok(true) => {
-                            witness_count = self.bl_eval_inst_impl_(io_regs, wit_regs, if_inst, phy_mem, vir_mem, phy_mem_op, ro_mem_op, vir_mem_op, wit_op, entry_witnesses, witness_count)?;
+                            (phy_mem, vir_mem, phy_mem_op, ro_mem_op, vir_mem_op, wit_op, witness_count) = self.bl_eval_inst_impl_(if_inst, phy_mem, vir_mem, phy_mem_op, ro_mem_op, vir_mem_op, wit_op, entry_witnesses, witness_count)?;
                         },
                         Ok(false) => {
-                            witness_count = self.bl_eval_inst_impl_(io_regs, wit_regs, else_inst, phy_mem, vir_mem, phy_mem_op, ro_mem_op, vir_mem_op, wit_op, entry_witnesses, witness_count)?;
+                            (phy_mem, vir_mem, phy_mem_op, ro_mem_op, vir_mem_op, wit_op, witness_count) = self.bl_eval_inst_impl_(else_inst, phy_mem, vir_mem, phy_mem_op, ro_mem_op, vir_mem_op, wit_op, entry_witnesses, witness_count)?;
                         },
                         Err(err) => return Err(format!(
                             "Const conditional expression eval failed: {} at\n{}",
@@ -785,17 +807,15 @@ impl<'ast> ZGen<'ast> {
                     }
                 }
                 BlockContent::Stmt(s) => {
-                    self.bl_eval_stmt_impl_(io_regs, wit_regs, s)?;
+                    self.bl_eval_stmt_impl_(s)?;
                 }
             }
         };
-        Ok(witness_count)
+        Ok((phy_mem, vir_mem, phy_mem_op, ro_mem_op, vir_mem_op, wit_op, witness_count))
     }
 
     fn bl_eval_stmt_impl_(
         &self,
-        io_regs: &mut Vec<Option<T>>,
-        wit_regs: &mut Vec<Option<T>>,
         s: &Statement,
     ) -> Result<(), String> {
         match s {
@@ -804,7 +824,7 @@ impl<'ast> ZGen<'ast> {
             }
             // %PHY should never appear in an assertion statement
             Statement::Assertion(a) => {
-                match self.bl_eval_expr_impl_(io_regs, wit_regs, &a.expression).and_then(|v| {
+                match self.expr_impl_::<true>(&a.expression).and_then(|v| {
                     const_bool(v)
                         .ok_or_else(|| "interpreting expr as const bool failed".to_string())
                 }) {
@@ -832,23 +852,61 @@ impl<'ast> ZGen<'ast> {
             }
             Statement::Conditional(_c) => {
                 panic!("Blocks should not contain conditional statements.")
+                /*
+                match self.expr_impl_::<true>(&c.condition).and_then(|v| {
+                    const_bool(v)
+                        .ok_or_else(|| "interpreting expr as const bool failed".to_string())
+                }) {
+                    Ok(true) => {
+                        for s in &c.ifbranch {
+                            self.bl_eval_stmt_impl_(s)?;
+                        }
+                    },
+                    Ok(false) => {
+                        for s in &c.elsebranch {
+                            self.bl_eval_stmt_impl_(s)?;
+                        }
+                    },
+                    Err(err) => return Err(format!(
+                        "Const conditional expression eval failed: {} at\n{}",
+                        err,
+                        span_to_string(c.condition.span()),
+                    ))
+                }
+                */
             }
             Statement::Definition(d) => {
                 // XXX(unimpl) multi-assignment unimplemented
                 assert!(d.lhs.len() <= 1);
 
                 self.set_lhs_ty_defn::<true>(&d)?;
-                let e = self.bl_eval_expr_impl_(io_regs, wit_regs, &d.expression)?;
+                let e = self.expr_impl_::<true>(&d.expression)?;
 
                 if let Some(l) = d.lhs.first() {
                     match l {
                         TypedIdentifierOrAssignee::Assignee(l) => {
-                            assert_eq!(l.accesses.len(), 0);
-                            self.bl_eval_assign_impl_(io_regs, wit_regs, &l.id.value, e)?;
+                            let strict = match &d.expression {
+                                Expression::Unary(u) => {
+                                    matches!(&u.op, UnaryOperator::Strict(_))
+                                }
+                                _ => false,
+                            };
+                            self.assign_impl_::<true>(&l.id.value, &l.accesses[..], e, strict)?;
                         }
                         TypedIdentifierOrAssignee::TypedIdentifier(l) => {
-                            // Do not reason about types
-                            self.bl_eval_assign_impl_(io_regs, wit_regs, &l.identifier.value, e)?;
+                            let decl_ty = self.type_impl_::<true>(&l.ty)?;
+                            let ty = e.type_();
+                            if &decl_ty != ty {
+                                return Err(format!(
+                                    "Assignment type mismatch: {} annotated vs {} actual",
+                                    decl_ty, ty,
+                                ));
+                            }
+                            self.declare_init_impl_::<true>(
+                                l.identifier.value.clone(),
+                                decl_ty,
+                                e,
+                            )?;
                         }
                     }
                 } else {
@@ -860,117 +918,6 @@ impl<'ast> ZGen<'ast> {
             Statement::ArrayDecl(_) => { panic!("Blocks should not contain array declaration statements.") }
         };
         Ok(())
-    }
-
-    fn bl_eval_expr_impl_(
-        &self,
-        io_regs: &Vec<Option<T>>,
-        wit_regs: &Vec<Option<T>>,
-        e: &Expression
-    ) -> Result<T, String> {
-        match e {
-            ast::Expression::Ternary(u) => {
-                match self.bl_eval_expr_impl_(io_regs, wit_regs, &u.first).ok().and_then(const_bool) {
-                    Some(true) => self.bl_eval_expr_impl_(io_regs, wit_regs, &u.second),
-                    Some(false) => self.bl_eval_expr_impl_(io_regs, wit_regs, &u.third),
-                    None => Err("ternary condition not const bool".to_string()),
-                }
-            }
-            ast::Expression::Binary(b) => {
-                let left = self.bl_eval_expr_impl_(io_regs, wit_regs, &b.left)?;
-                let right = self.bl_eval_expr_impl_(io_regs, wit_regs, &b.right)?;
-                let op = self.bin_op(&b.op);
-                op(left, right)
-            }
-            ast::Expression::Unary(u) => {
-                let arg = self.bl_eval_expr_impl_(io_regs, wit_regs, &u.expression)?;
-                let op = self.unary_op(&u.op);
-                op(arg)
-            }
-            ast::Expression::Identifier(i) => {
-                self.bl_eval_identifier_impl_(io_regs, wit_regs, &i.value)
-            },
-            ast::Expression::Literal(l) => self.literal_(l),
-            ast::Expression::InlineArray(_) => {
-                Err(format!("Blocks should not contain inline arrays!"))
-            }
-            ast::Expression::ArrayInitializer(_) => {
-                Err(format!("Blocks should not contain array initializers!"))
-            }
-            ast::Expression::Postfix(_) => {
-                Err(format!("Blocks should not contain postfixes!"))
-            }
-            ast::Expression::InlineStruct(_) => {
-                Err(format!("Blocks should not contain inline structs!"))
-            }
-        }
-        .and_then(|res| const_val(res))
-        .map_err(|err| format!("{}; context:\n{}", err, span_to_string(e.span())))
-    }
-
-    fn bl_eval_assign_impl_(
-        &self,
-        io_regs: &mut Vec<Option<T>>,
-        wit_regs: &mut Vec<Option<T>>,
-        reg_name: &str,
-        val: T
-     ) -> Result<(), String> {
-        let name_bytes = reg_name.as_bytes();
-        match name_bytes[1] {
-            b'i' | b'o' => {
-                let reg_index = self.reg_name_to_index(&reg_name)?;
-                if io_regs.len() <= reg_index {
-                    io_regs.extend(vec![None; reg_index - io_regs.len() + 1])
-                }
-                io_regs[reg_index] = Some(val);
-                Ok(())
-            },
-            b'w' => {
-                let reg_index = self.reg_name_to_index(&reg_name)?;
-                if wit_regs.len() <= reg_index {
-                    wit_regs.extend(vec![None; reg_index - wit_regs.len() + 1])
-                }
-                wit_regs[reg_index] = Some(val);
-                Ok(())
-            },
-            _ => {
-                Err(format!("Unknown register: {}", reg_name))
-            }
-        }
-    }
-
-    fn bl_eval_identifier_impl_(
-        &self,
-        io_regs: &Vec<Option<T>>,
-        wit_regs: &Vec<Option<T>>,
-        reg_name: &str,
-    ) -> Result<T, String> {
-        let name_bytes = reg_name.as_bytes();
-        match name_bytes[1] {
-            b'i' | b'o' => {
-                let reg_index = self.reg_name_to_index(&reg_name)?;
-                if io_regs.len() <= reg_index {
-                    Err(format!("Input register {} is uninitialized", reg_name))
-                } else {
-                    io_regs[self.reg_name_to_index(&reg_name)?].clone().ok_or(
-                        format!("Input register {} is uninitialized", reg_name)
-                    )
-                }
-            },
-            b'w' => {
-                let reg_index = self.reg_name_to_index(&reg_name)?;
-                if wit_regs.len() <= reg_index {
-                    Err(format!("Witness register {} is uninitialized", reg_name))
-                } else {
-                    wit_regs[self.reg_name_to_index(&reg_name)?].clone().ok_or(
-                        format!("Witness register {} is uninitialized", reg_name)
-                    )
-                }
-            },
-            _ => {
-                Err(format!("Unknown register: {}", reg_name))
-            }
-        }
     }
 }
 
