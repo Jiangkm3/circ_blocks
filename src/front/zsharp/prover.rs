@@ -1,4 +1,5 @@
 use std::iter::zip;
+use pretty::pretty_expr;
 use zokrates_pest_ast::*;
 use crate::front::zsharp::ZGen;
 use crate::front::zsharp::T;
@@ -451,6 +452,19 @@ impl<'ast> ZGen<'ast> {
             let wit_op: Vec<T>;
             (nb, terminated, phy_mem_op, vir_mem_op, wit_op, witness_count) = 
                 self.bl_eval_impl_(&bls[nb], &mut io_regs, &mut wit_regs, &mut phy_mem, &mut vir_mem, entry_witnesses, witness_count)?;
+            // Remove undeclared %o registers
+            let mut live_o_regs = vec![false; io_regs.len()];
+            if bl_exec_state.len() > 1 {
+                for (name, _) in &bls[bl_exec_state[tr_size].blk_id].outputs {
+                    let reg_index = self.reg_name_to_index(name)?;
+                    live_o_regs[reg_index] = true;
+                }
+                for i in 0..io_regs.len() {
+                    if !live_o_regs[i] {
+                        io_regs[i] = None;
+                    }
+                }
+            }
             // Update successor block ID
             bl_exec_state[tr_size].succ_id = nb;
             // Update Memory Op
@@ -588,8 +602,16 @@ impl<'ast> ZGen<'ast> {
                     let new_pointer_t = add(pointer_t, len_t).unwrap();
                     self.bl_eval_assign_impl_(io_regs, wit_regs, if *read_only { W_SP } else { W_AS }, new_pointer_t)?;
                 }
-                BlockContent::Store((val_expr, _, arr, id_expr, init, read_only)) => {
+                BlockContent::Store((val_expr, ty, arr, id_expr, init, read_only)) => {
                     let mut val_t = self.bl_eval_expr_impl_(io_regs, wit_regs, &val_expr)?;
+                    let entry_ty = val_t.type_();
+                    if ty != entry_ty {
+                        return Err(format!(
+                            "STORE type mismatch: {} annotated vs {} actual",
+                            ty, entry_ty,
+                        ));
+                    }
+
                     let mut id_t = self.bl_eval_expr_impl_(io_regs, wit_regs, &id_expr)?;
 
                     // Add array offset to obtain address
@@ -655,7 +677,7 @@ impl<'ast> ZGen<'ast> {
                         ));
                     }
                 }
-                BlockContent::Load((var, _, arr, id_expr, read_only)) => {
+                BlockContent::Load((var, ty, arr, id_expr, read_only)) => {
                     let mut id_t = self.bl_eval_expr_impl_(io_regs, wit_regs, &id_expr)?;
 
                     // Add array offset to obtain address
@@ -672,7 +694,13 @@ impl<'ast> ZGen<'ast> {
                     } else {
                         vir_mem[addr].clone().ok_or(format!("LOAD failed: entry {} is uninitialized.", addr))?
                     };
-                    // Do not reason about typing
+                    let entry_ty = val_t.type_();
+                    if ty != entry_ty {
+                        return Err(format!(
+                            "LOAD type mismatch: {} annotated vs {} actual",
+                            ty, entry_ty,
+                        ));
+                    }
                     self.bl_eval_assign_impl_(io_regs, wit_regs, var, val_t.clone())?;
                     // Convert val_t to field for MemOp
                     if val_t.type_() != &Ty::Field {
@@ -836,8 +864,6 @@ impl<'ast> ZGen<'ast> {
             Statement::Definition(d) => {
                 // XXX(unimpl) multi-assignment unimplemented
                 assert!(d.lhs.len() <= 1);
-
-                self.set_lhs_ty_defn::<true>(&d)?;
                 let e = self.bl_eval_expr_impl_(io_regs, wit_regs, &d.expression)?;
 
                 if let Some(l) = d.lhs.first() {
@@ -847,7 +873,14 @@ impl<'ast> ZGen<'ast> {
                             self.bl_eval_assign_impl_(io_regs, wit_regs, &l.id.value, e)?;
                         }
                         TypedIdentifierOrAssignee::TypedIdentifier(l) => {
-                            // Do not reason about types
+                            let decl_ty = self.type_impl_::<true>(&l.ty)?;
+                            let ty = e.type_();
+                            if &decl_ty != ty {
+                                return Err(format!(
+                                    "Assignment type mismatch: {} annotated vs {} actual",
+                                    decl_ty, ty,
+                                ));
+                            }
                             self.bl_eval_assign_impl_(io_regs, wit_regs, &l.identifier.value, e)?;
                         }
                     }

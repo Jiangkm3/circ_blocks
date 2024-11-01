@@ -780,6 +780,8 @@ fn get_run_time_knowledge<const VERBOSE: bool>(
     total_num_init_phy_mem_accesses: usize,
     total_num_init_vir_mem_accesses: usize,
 ) -> RunTimeKnowledge {
+    let interpret_start = Instant::now();
+
     let num_blocks = ctk.block_num_instances;
     let num_input_unpadded = ctk.num_inputs_unpadded;
     let io_width = 2 * num_input_unpadded;
@@ -807,7 +809,10 @@ fn get_run_time_knowledge<const VERBOSE: bool>(
 
         ZSharpFE::interpret(inputs, &entry_regs, &entry_stacks, &entry_arrays, &entry_witnesses)
     };
+    let interpret_time = interpret_start.elapsed();
+    println!("\n--\nInterpret time: {}ms", interpret_time.as_millis());
 
+    let block_start = Instant::now();
     // Meta info
     // The most time any block is executed
     let mut block_max_num_proofs = 0;
@@ -941,7 +946,10 @@ fn get_run_time_knowledge<const VERBOSE: bool>(
         exec_inputs.push(inputs_assignment.clone());
         block_vars_matrix[slot].push(vars_assignment);
     }
+    let block_time = block_start.elapsed();
+    println!("\n--\nBlock gen time: {}ms", block_time.as_millis());
 
+    let mem_start = Instant::now();
     // Initial Physical & Virtual Memory: valid, _, addr, data (ts and ls are both 0 and are not recorded)
     let mut init_phy_mems_list = Vec::new();
     for i in 0..init_phy_mem_list.len() {
@@ -1039,6 +1047,8 @@ fn get_run_time_knowledge<const VERBOSE: bool>(
     // Fold entry_arrays
     let entry_stacks = entry_stacks.into_iter().fold(Vec::new(), |acc, a| [acc, a].concat()).to_vec();
     let entry_arrays = entry_arrays.into_iter().fold(Vec::new(), |acc, a| [acc, a].concat()).to_vec();
+    let mem_time = mem_start.elapsed();
+    println!("\n--\nMem gen time: {}ms", mem_time.as_millis());
 
     println!("\n--\nFUNC");
     print!("{:3} ", " ");
