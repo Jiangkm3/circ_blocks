@@ -1679,6 +1679,7 @@ impl<'ast> ZGen<'ast> {
                             let (callee_path, callee_name) = self.deref_import(&p.id.value);
                             let mut args: Vec<Expression> = Vec::new();
                             let mut new_expr: Expression;
+
                             for old_expr in &c.arguments.expressions {
                                 (blks, blks_len, var_scope_info, new_expr, func_count, array_count, struct_count, load_count) = 
                                     self.bl_gen_expr_::<IS_MAIN>(blks, blks_len, old_expr, f_name, func_count, array_count, struct_count, load_count, var_scope_info)?;
@@ -1706,7 +1707,6 @@ impl<'ast> ZGen<'ast> {
                                 };
                                 let struct_ty = load_ty.clone();
                                 let cur_scope = blks[blks_len - 1].scope;
-                                var_scope_info.declare_var(&load_name, &f_name, cur_scope, load_ty.clone());
 
                                 // Assert that all remaining accesses are struct member accesses
                                 let mut member_accesses = Vec::new();
@@ -1725,6 +1725,7 @@ impl<'ast> ZGen<'ast> {
                                     }
                                     acc_counter += 1;
                                 }
+                                var_scope_info.declare_var(&load_name, &f_name, cur_scope, load_ty.clone());
 
                                 // Process the index
                                 let index_ty = self.bl_gen_type_(&e, f_name, &var_scope_info)?;
