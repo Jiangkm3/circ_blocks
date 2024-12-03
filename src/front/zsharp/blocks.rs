@@ -95,9 +95,10 @@ fn access_to_offset(ty: &Ty, acc: &[MemberAccess]) -> (usize, usize){
     if let Ty::Struct(_, members) = ty {
         let mut size = 0;
         let mut offset = size;
-        // if acc_encountered is true, then offset no longer inreases
+        // if acc_encountered is true, then offset no longer increases
         let mut acc_encountered = acc.len() == 0;
-        for (m_name, m_ty) in &members.clone().into_map() {
+        for m_name in members.org_fields() {
+            let m_ty = members.search(m_name).unwrap().1;
             if acc.len() > 0 && &acc[0].id.value == m_name {
                 let (m_size, m_offset) = access_to_offset(m_ty, &acc[1..]);
                 size += m_size;
@@ -213,6 +214,19 @@ pub fn bl_gen_increment_stmt<'ast>(var: &str, offset: usize, ty: &Ty) -> Stateme
         span: Span::new("", 0, 0).unwrap()
     });     
     var_update_stmt   
+}
+
+// Flatten out any struct in pre-order
+pub fn flatten_var(var_name: &str, ty: &Ty, var_list: &mut Vec<(String, Ty)>) {
+    if let Ty::Struct(_, members) = ty {
+        for m in members.org_fields() {
+            let m_ty = members.search(m).unwrap().1;
+            let member_name = format!("{}^{}", var_name, m);
+            flatten_var(&member_name, &m_ty, var_list);
+        }
+    } else {
+        var_list.push((var_name.to_string(), ty.clone()));
+    }
 }
 
 #[derive(Clone)]
@@ -403,9 +417,9 @@ impl VarScopeInfo {
         let name = &(var_name.to_string(), fn_name.to_string());
         // Declare struct members
         if let Ty::Struct(_, members) = &ty {
-            for (m, m_ty) in members.clone().into_map() {
+            for (m, m_ty) in members.fields() {
                 let member_name = format!("{}^{}", var_name, m);
-                self.declare_var(&member_name, fn_name, cur_scope, m_ty);
+                self.declare_var(&member_name, fn_name, cur_scope, m_ty.clone());
             }
         }
         // Declare self
@@ -609,6 +623,7 @@ impl<'ast> ZGen<'ast> {
         let inputs: Vec<(String, Ty)>;
         (blks, blks_len, inputs, var_scope_info) = self.bl_gen_function_init_::<true>(blks, blks_len, f_file.clone(), f_name, var_scope_info)
             .unwrap_or_else(|e| panic!("const_entry_fn failed: {}", e));
+
         func_blk_map.insert("main".to_string(), (0, blks_len - 1, false));
         // other functions
         for (func_file, funcs) in &self.functions {
@@ -781,8 +796,13 @@ impl<'ast> ZGen<'ast> {
             for p in f.parameters.clone().into_iter() {
                 let p_id = p.id.value.clone();
                 let p_ty = self.type_impl_::<false>(&p.ty)?;
-                var_scope_info.declare_var(&p_id, &f_name, 0, p_ty);
-                inputs.push(var_scope_info.reference_var(&p_id, &f_name)?.clone());     
+                var_scope_info.declare_var(&p_id, &f_name, 0, p_ty.clone());
+                // Flatten out inputs
+                let mut flattened_p = Vec::new();
+                flatten_var(&p_id, &p_ty, &mut flattened_p);
+                for (p_entry, _) in flattened_p {
+                    inputs.push(var_scope_info.reference_var(&p_entry, &f_name)?.clone());
+                }
             }
             // Declare all constants, if not main
             // Constants of main function are already declared in bl_gen_constants
@@ -1341,8 +1361,8 @@ impl<'ast> ZGen<'ast> {
                                             if let AssigneeAccess::Member(m) = &l.accesses[acc_counter] {
                                                 member_accesses.push(m.clone());
                                                 if let Ty::Struct(_, members) = &entry_ty {
-                                                    entry_ty = members.clone().into_map().get(&m.id.value)
-                                                        .ok_or(format!("Array struct {} does not have member {}!", l.id.value, m.id.value))?.clone();
+                                                    entry_ty = members.search(&m.id.value)
+                                                        .ok_or(format!("Array struct {} does not have member {}!", l.id.value, m.id.value))?.1.clone();
                                                 } else {
                                                     return Err(format!("Cannot perform member access on non-struct {}!", l.id.value));
                                                 }
@@ -1420,7 +1440,7 @@ impl<'ast> ZGen<'ast> {
             if let Expression::Identifier(ie) = &new_r_expr {
                 // Strip scope & f_name out of r
                 let r = ie.value.split(".").next().unwrap_or("");
-                for (m, m_ty) in members.clone().into_map() {
+                for (m, m_ty) in members.fields() {
                     let l_member = format!("{l}^{m}");
                     let r_member = format!("{r}^{m}");
                     let new_r_member = if r_member.len() >= 4 && &r_member[..4] == "%RET" {
@@ -1432,7 +1452,7 @@ impl<'ast> ZGen<'ast> {
                         value: new_r_member,
                         span: Span::new("", 0, 0).unwrap()
                     });
-                    (blks, blks_len) = self.bl_gen_def_stmt_(blks, blks_len, &l_member, &new_r_member_expr, &m_ty, l_f_name, r_f_name, var_scope_info)?;
+                    (blks, blks_len) = self.bl_gen_def_stmt_(blks, blks_len, &l_member, &new_r_member_expr, m_ty, l_f_name, r_f_name, var_scope_info)?;
                 }
             } else {
                 return Err(format!("Struct assignment failed: cannot identify RHS of definition statement: {:?}", new_r_expr));
@@ -1486,7 +1506,7 @@ impl<'ast> ZGen<'ast> {
             if let Expression::Identifier(ie) = &new_entry_expr {
                 // Strip scope & f_name out of r
                 let r = ie.value.split(".").next().unwrap_or("");
-                for (m, m_ty) in members.clone().into_map() {
+                for (m, m_ty) in members.fields() {
                     let new_r_member = var_scope_info.reference_var(&format!("{r}^{m}"), r_f_name)?.0;
                     let new_r_member_expr = Expression::Identifier(IdentifierExpression {
                         value: new_r_member,
@@ -1507,7 +1527,7 @@ impl<'ast> ZGen<'ast> {
                         index_ty,
                         new_index_expr,
                         &new_r_member_expr,
-                        &m_ty,
+                        m_ty,
                         r_f_name,
                         var_scope_info,
                         is_alloc,
@@ -1557,7 +1577,7 @@ impl<'ast> ZGen<'ast> {
         let new_l = if l.chars().next().unwrap() == '%' { l.to_string() } else { var_scope_info.reference_var(&l, l_f_name)?.0 };
         // Struct load
         if let Ty::Struct(_, members) = cur_ty {
-            for (m, m_ty) in members.clone().into_map() {
+            for (m, m_ty) in members.fields() {
                 let l_member = format!("{l}^{m}");
                 let mut next_accesses = prev_accesses.clone();
                 next_accesses.push(MemberAccess {
@@ -1574,7 +1594,7 @@ impl<'ast> ZGen<'ast> {
                     arr_extended_name,
                     index_ty,
                     new_index_expr,
-                    &m_ty,
+                    m_ty,
                     l_f_name,
                     var_scope_info,
                     struct_ty,
@@ -1715,8 +1735,8 @@ impl<'ast> ZGen<'ast> {
                                     if let Access::Member(m) = &p.accesses[acc_counter] {
                                         member_accesses.push(m.clone());
                                         if let Ty::Struct(_, members) = &load_ty {
-                                            load_ty = members.clone().into_map().get(&m.id.value)
-                                                .ok_or(format!("Array struct {} does not have member {}!", arr_name, m.id.value))?.clone();
+                                            load_ty = members.search(&m.id.value)
+                                                .ok_or(format!("Array struct {} does not have member {}!", arr_name, m.id.value))?.1.clone();
                                         } else {
                                             return Err(format!("Cannot perform member access on non-struct {}!", arr_name));
                                         }
@@ -2106,7 +2126,7 @@ impl<'ast> ZGen<'ast> {
                             Access::Member(m) => {
                                 let member_name = &m.id.value;
                                 let member_ty = if let Ty::Struct(_, members) = var_ty {
-                                    members.clone().into_map().get(member_name).ok_or_else(|| format!("Member {} does not exist in struct {}!", member_name, var_extended_name))?.clone()
+                                    members.search(member_name).ok_or_else(|| format!("Member {} does not exist in struct {}!", member_name, var_extended_name))?.1.clone()
                                 } else {
                                     return Err(format!("Accessing member {} of a variable {} that is not a struct!", member_name, var_extended_name));
                                 };

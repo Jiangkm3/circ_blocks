@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use zokrates_pest_ast::*;
 use crate::front::zsharp::blocks::*;
+use crate::front::zsharp::pretty::pretty_block_content;
 use std::collections::{BTreeMap, BTreeSet};
 use crate::front::zsharp::Ty;
 use itertools::Itertools;
@@ -89,7 +90,7 @@ fn print_bls(bls: &Vec<Block>, entry_bl: &usize) {
     for b in bls {
         b.pretty();
         println!("");
-    }    
+    }
 }
 
 // --
@@ -645,6 +646,15 @@ fn is_bp_update(s: &Statement) -> bool {
     return false;
 }
 
+/*
+// Given a variable and function, determine if the variable belongs to the function
+fn var_fn_match(var_name: &String, fn_name: &String) -> Boolean {
+    // var can be of form name@fn1@fn2.fn.scope.ver
+    // if fn1 exists, match fn1 with fn_name, otherwise match fn with fn_name
+    
+}
+*/
+
 // Liveness analysis
 // GEN all variables in gen
 fn la_gen(
@@ -689,10 +699,10 @@ fn var_fn_merge(
         1 => { return var.to_string(); },
         2 => {
             if parts[1] == old_f_name {
-                // %RET is still %RET, no need to change that
+                // %RET is still %RET, no need to change function name
                 let mut new_var_name = parts[0].to_string();
                 new_var_name.push_str(".");
-                new_var_name.push_str(new_f_name);
+                new_var_name.push_str(old_f_name);
                 return new_var_name;
             } else {
                 return var.to_string();
@@ -1146,14 +1156,20 @@ fn tydef_to_assignee_stmt<'ast, const IN_BRANCH: bool>(
 // --
 
 // Liveness Analysis
-fn la_inst<'ast>(
+// If not in ELIM mode, does not care about new_state, or new mem_op_counts
+fn la_inst<'ast, const ELIM: bool>(
     // Overall live variable set
     mut state: BTreeSet<String>,
     // One live variable set per each function call trace, expressed as a BTreeMap
     mut state_per_call_trace: BTreeMap<Vec<usize>, BTreeSet<String>>,
     inst: &Vec<BlockContent<'ast>>
-) -> (BTreeSet<String>, BTreeMap<Vec<usize>, BTreeSet<String>>, Vec<BlockContent<'ast>>) {
+) -> (
+    BTreeSet<String>, BTreeMap<Vec<usize>, BTreeSet<String>>, Vec<BlockContent<'ast>>, 
+    usize, usize // Number of RO and VM accesses
+) {
     let mut new_instructions = Vec::new();
+    let mut num_ro_ops = 0;
+    let mut num_vm_ops = 0;
     for i in inst.iter().rev() {
         match i {
             BlockContent::Witness((var, ty, _)) => {
@@ -1161,6 +1177,9 @@ fn la_inst<'ast>(
                 if is_alive(&state, var) {
                     new_instructions.insert(0, BlockContent::Witness((var.clone(), ty.clone(), true)));
                     state.remove(var);
+                    for (_, s) in state_per_call_trace.iter_mut() {
+                        s.remove(var);
+                    }
                 } else {
                     new_instructions.insert(0, BlockContent::Witness((var.clone(), ty.clone(), false)));
                 }
@@ -1214,6 +1233,11 @@ fn la_inst<'ast>(
             BlockContent::Store((val_expr, _, arr, id_expr, _, read_only)) => {
                 // if is_alive(&state, arr) {
                     new_instructions.insert(0, i.clone());
+                    if *read_only {
+                        num_ro_ops += 1;
+                    } else {
+                        num_vm_ops += 1;
+                    }
                     state.insert(arr.to_string());
                     let val_gen = expr_find_val(val_expr);
                     la_gen(&mut state, &val_gen);
@@ -1236,6 +1260,11 @@ fn la_inst<'ast>(
             BlockContent::Load((val, _, arr, id_expr, read_only)) => {
                 if is_alive(&state, val) {
                     new_instructions.insert(0, i.clone());
+                    if *read_only {
+                        num_ro_ops += 1;
+                    } else {
+                        num_vm_ops += 1;
+                    }
                     state.remove(val);
                     state.insert(arr.to_string());
                     let gen = expr_find_val(id_expr);
@@ -1256,6 +1285,11 @@ fn la_inst<'ast>(
             // Do not reason about liveness of dummy loads, mark %TS as alive
             BlockContent::DummyLoad(read_only) => {
                 new_instructions.insert(0, i.clone());
+                if *read_only {
+                    num_ro_ops += 1;
+                } else {
+                    num_vm_ops += 1;
+                }
                 if !*read_only {
                     state.insert("%TS".to_string());
                 }
@@ -1267,10 +1301,10 @@ fn la_inst<'ast>(
             }
             BlockContent::Branch((cond, if_inst, else_inst)) => {
                 // Liveness of branches
-                let (mut new_if_state, mut new_if_state_per_call_trace, new_if_inst) = 
-                    la_inst(state.clone(), state_per_call_trace.clone(), if_inst);
-                let (new_else_state, new_else_state_per_call_trace, new_else_inst) = 
-                    la_inst(state.clone(), state_per_call_trace.clone(), else_inst);
+                let (mut new_if_state, mut new_if_state_per_call_trace, new_if_inst, left_ro_ops, left_vm_ops) = 
+                    la_inst::<ELIM>(state.clone(), state_per_call_trace.clone(), if_inst);
+                let (new_else_state, new_else_state_per_call_trace, new_else_inst, right_ro_ops, right_vm_ops) = 
+                    la_inst::<ELIM>(state.clone(), state_per_call_trace.clone(), else_inst);
                 new_if_state.extend(new_else_state);
                 assert_eq!(new_if_state_per_call_trace.len(), new_else_state_per_call_trace.len());
                 for (entry_point, _) in new_if_state_per_call_trace.clone() {
@@ -1284,9 +1318,17 @@ fn la_inst<'ast>(
                 for (_, s) in state_per_call_trace.iter_mut() {
                     la_gen(s, &gen);
                 }
-                // Branch is dead if both branches are empty
-                if new_if_inst.len() > 0 || new_else_inst.len() > 0 {
+                // Branch is dead if both branches are empty or contain only dummyloads
+                let is_branch_alive = |bc: &Vec<BlockContent<'ast>>| 
+                    bc.iter().fold(false, |b, i| b || !matches!(i, BlockContent::DummyLoad(_)));
+                if is_branch_alive(&new_if_inst) || is_branch_alive(&new_else_inst) {
                     new_instructions.insert(0, BlockContent::Branch((cond.clone(), new_if_inst, new_else_inst)));
+                    if ELIM {
+                        assert_eq!(left_ro_ops, right_ro_ops);
+                        assert_eq!(left_vm_ops, right_vm_ops);
+                    }
+                    num_ro_ops += left_ro_ops;
+                    num_vm_ops += right_vm_ops;
                 }
             }
             BlockContent::Stmt(s) => {
@@ -1306,7 +1348,7 @@ fn la_inst<'ast>(
             }
         }
     }
-    (state, state_per_call_trace, new_instructions)
+    (state, state_per_call_trace, new_instructions, num_ro_ops, num_vm_ops)
 }
 
 // Typing
@@ -1651,7 +1693,7 @@ impl<'ast> ZGen<'ast> {
     // BLOCK OPTIMIZATION
     // --
 
-    // Returns: blks, entry_bl, input_liveness
+    // Returns: blks, entry_bl, live_input_set
     // Inputs are (variable, type) pairs
     pub fn optimize_block(
         &self,
@@ -1661,7 +1703,7 @@ impl<'ast> ZGen<'ast> {
         // When no_opt is set, DO NOT perform Merge / Spilling
         no_opt: bool,
         VERBOSE: bool,
-    ) -> (Vec<Block<'ast>>, usize, Vec<bool>) {
+    ) -> (Vec<Block<'ast>>, usize, BTreeSet<String>) {
         println!("\n\n--\nOptimization:");
         // Add %SP and %AS to program input
         inputs.insert(0, ("%AS".to_string(), Ty::Field));
@@ -1830,13 +1872,13 @@ impl<'ast> ZGen<'ast> {
         }
 
         // Set I/O again after optimizations
-        let input_liveness: Vec<bool>;
-        (bls, input_liveness) = self.set_input_output(bls, &successor, &predecessor, &predecessor_fn, &entry_bl, &exit_bls, &entry_bls_fn, &exit_bls_fn, &call_exit_entry_map, inputs.clone());
+        let live_input_set: BTreeSet<String>;
+        (bls, live_input_set) = self.set_input_output(bls, &successor, &predecessor, &predecessor_fn, &entry_bl, &exit_bls, &entry_bls_fn, &exit_bls_fn, &call_exit_entry_map, inputs.clone());
         if VERBOSE {
             println!("\n\n--\nSet Input Output after Spilling:");
             print_bls(&bls, &entry_bl);
         }
-        (bls, entry_bl, input_liveness)
+        (bls, entry_bl, live_input_set)
     }
 
     // Return value: successor, rp_successor, successor_fn, visited, next_bls
@@ -2076,7 +2118,7 @@ impl<'ast> ZGen<'ast> {
                 // KILL and GEN within the block
                 // We do not need to worry about state_per_trace in liveness analysis
                 // Only useful in set_input_output
-                (state, _, _) = la_inst(state, BTreeMap::new(), &bls[cur_bl].instructions);
+                (state, _, _, _, _) = la_inst::<false>(state, BTreeMap::new(), &bls[cur_bl].instructions);
                 bl_in[cur_bl] = state;
 
                 // Block Transition
@@ -2118,8 +2160,12 @@ impl<'ast> ZGen<'ast> {
                     BlockTerminator::ProgTerm => {}            
                 }
 
-                (_, _, new_instructions) = la_inst(state, BTreeMap::new(), &bls[cur_bl].instructions);
+                let num_ro_ops: usize;
+                let num_vm_ops: usize;
+                (_, _, new_instructions, num_ro_ops, num_vm_ops) = la_inst::<true>(state, BTreeMap::new(), &bls[cur_bl].instructions);
                 bls[cur_bl].instructions = new_instructions;
+                bls[cur_bl].num_ro_ops = num_ro_ops;
+                bls[cur_bl].num_vm_ops = num_vm_ops;
 
                 // Block Transition
                 for tmp_bl in &predecessor[cur_bl] {
@@ -2149,77 +2195,83 @@ impl<'ast> ZGen<'ast> {
         mut entry_bls_fn: BTreeSet<usize>,
         mut exit_bls_fn: BTreeSet<usize>,
     ) -> Vec<Block<'ast>> {
+        // Repeatedly scan through all blocks until no function can be merged
+        let mut changed = true;
         // Iterate through CFG, find all functions that are called once
-        for callee in 0..bls.len() {
-            if entry_bls_fn.contains(&callee) && predecessor[callee].len() == 1 {
-                let caller = predecessor[callee].first().unwrap().clone();
-                // Update fn_num_exec_bound of callee
-                let num_exec_factor = bls[caller].fn_num_exec_bound;
-                let caller_fn = &bls[caller].fn_name.clone();
-                let callee_fn = &bls[callee].fn_name.clone();
-                let scope_diff = bls[caller].scope + 1;
-                // Find func call exit block
-                assert_eq!(successor_fn[caller].len(), 1);
-                let caller_exit = successor_fn[caller].first().unwrap().clone();
-                // Update CFG
-                successor_fn[caller] = BTreeSet::from([callee]);
-                entry_bls_fn.remove(&callee);
-                
-                // Merge callee with caller
-                // First on caller (to deal with call parameters)
-                bls[caller].instructions = fm_inst::<true>(&bls[caller].instructions, callee_fn, caller_fn, scope_diff);
-                // Then on callee
-                let mut visited: Vec<bool> = vec![false; bls.len()];
-                let mut next_bls: VecDeque<usize> = VecDeque::new();
-                next_bls.push_back(callee);
-                while !next_bls.is_empty() {
-                    let cur_bl = next_bls.pop_front().unwrap();
-                    // Only visit each block once
-                    if !visited[cur_bl] {
-                        visited[cur_bl] = true;
-                        assert_eq!(&bls[cur_bl].fn_name, callee_fn);
-                        bls[cur_bl].fn_name = caller_fn.clone();
-                        bls[cur_bl].scope += scope_diff;
-                        bls[cur_bl].fn_num_exec_bound *= num_exec_factor;
-                        bls[cur_bl].instructions = fm_inst::<false>(&bls[cur_bl].instructions, callee_fn, caller_fn, scope_diff);
-                        // Update terminator
-                        if let BlockTerminator::Transition(e) = &bls[cur_bl].terminator {
-                            bls[cur_bl].terminator = BlockTerminator::Transition(expr_replace_fn(e, callee_fn, caller_fn, scope_diff));
-                        } else {
-                            unreachable!();
-                        }
-
-                        // Update terminator and push in successors
-                        if exit_bls_fn.contains(&cur_bl) {
-                            // Update CFG
-                            exit_bls_fn.remove(&cur_bl);
-                            assert_eq!(successor_fn[cur_bl].len(), 0);
-                            successor_fn[cur_bl] = BTreeSet::from([caller_exit]);
-                            // Assert terminator is rp@ and replace it with caller_exit
-                            if let BlockTerminator::Transition(Expression::Identifier(ie)) = &bls[cur_bl].terminator {
-                                assert!(is_rp(&ie.value).is_some());
-                                bls[cur_bl].terminator = BlockTerminator::Transition(Expression::Literal(LiteralExpression::DecimalLiteral(DecimalLiteralExpression {
-                                    value: DecimalNumber {
-                                        value: format!("{}", caller_exit),
-                                        span: Span::new("", 0, 0).unwrap()
-                                    },
-                                    suffix: Some(ty_to_dec_suffix(&Type::Basic(BasicType::Field(FieldType {
-                                        span: Span::new("", 0, 0).unwrap()
-                                    })))),
-                                    span: Span::new("", 0, 0).unwrap()
-                                })))
+        while changed {
+            changed = false;
+            for callee in 0..bls.len() {
+                if entry_bls_fn.contains(&callee) && predecessor[callee].len() == 1 {
+                    changed = true;
+                    let caller = predecessor[callee].first().unwrap().clone();
+                    // Update fn_num_exec_bound of callee
+                    let num_exec_factor = bls[caller].fn_num_exec_bound;
+                    let caller_fn = &bls[caller].fn_name.clone();
+                    let callee_fn = &bls[callee].fn_name.clone();
+                    let scope_diff = bls[caller].scope + 1;
+                    // Find func call exit block
+                    assert_eq!(successor_fn[caller].len(), 1);
+                    let caller_exit = successor_fn[caller].first().unwrap().clone();
+                    // Update CFG
+                    successor_fn[caller] = BTreeSet::from([callee]);
+                    entry_bls_fn.remove(&callee);
+                    
+                    // Merge callee with caller
+                    // First on caller (to deal with call parameters)
+                    bls[caller].instructions = fm_inst::<true>(&bls[caller].instructions, callee_fn, caller_fn, scope_diff);
+                    // Then on callee
+                    let mut visited: Vec<bool> = vec![false; bls.len()];
+                    let mut next_bls: VecDeque<usize> = VecDeque::new();
+                    next_bls.push_back(callee);
+                    while !next_bls.is_empty() {
+                        let cur_bl = next_bls.pop_front().unwrap();
+                        // Only visit each block once
+                        if !visited[cur_bl] {
+                            visited[cur_bl] = true;
+                            assert_eq!(&bls[cur_bl].fn_name, callee_fn);
+                            bls[cur_bl].fn_name = caller_fn.clone();
+                            bls[cur_bl].scope += scope_diff;
+                            bls[cur_bl].fn_num_exec_bound *= num_exec_factor;
+                            bls[cur_bl].instructions = fm_inst::<false>(&bls[cur_bl].instructions, callee_fn, caller_fn, scope_diff);
+                            // Update terminator
+                            if let BlockTerminator::Transition(e) = &bls[cur_bl].terminator {
+                                bls[cur_bl].terminator = BlockTerminator::Transition(expr_replace_fn(e, callee_fn, caller_fn, scope_diff));
                             } else {
                                 unreachable!();
                             }
-                        } else {
-                            for s in &successor_fn[cur_bl] {
-                                next_bls.push_back(*s);
+
+                            // Update terminator and push in successors
+                            if exit_bls_fn.contains(&cur_bl) {
+                                // Update CFG
+                                exit_bls_fn.remove(&cur_bl);
+                                assert_eq!(successor_fn[cur_bl].len(), 0);
+                                successor_fn[cur_bl] = BTreeSet::from([caller_exit]);
+                                // Assert terminator is rp@ and replace it with caller_exit
+                                if let BlockTerminator::Transition(Expression::Identifier(ie)) = &bls[cur_bl].terminator {
+                                    assert!(is_rp(&ie.value).is_some());
+                                    bls[cur_bl].terminator = BlockTerminator::Transition(Expression::Literal(LiteralExpression::DecimalLiteral(DecimalLiteralExpression {
+                                        value: DecimalNumber {
+                                            value: format!("{}", caller_exit),
+                                            span: Span::new("", 0, 0).unwrap()
+                                        },
+                                        suffix: Some(ty_to_dec_suffix(&Type::Basic(BasicType::Field(FieldType {
+                                            span: Span::new("", 0, 0).unwrap()
+                                        })))),
+                                        span: Span::new("", 0, 0).unwrap()
+                                    })))
+                                } else {
+                                    unreachable!();
+                                }
+                            } else {
+                                for s in &successor_fn[cur_bl] {
+                                    next_bls.push_back(*s);
+                                }
                             }
                         }
                     }
+                    // Finally on caller_exit
+                    bls[caller_exit].instructions = fm_inst::<false>(&bls[caller_exit].instructions, callee_fn, caller_fn, scope_diff);
                 }
-                // Finally on caller_exit
-                bls[caller_exit].instructions = fm_inst::<false>(&bls[caller_exit].instructions, callee_fn, caller_fn, scope_diff);
             }
         }
 
@@ -2227,7 +2279,7 @@ impl<'ast> ZGen<'ast> {
     }
 
     // For each block, set its input to be variables that are alive & defined at the entry point of the block and their type
-    // Returns: bls, input_liveness
+    // Returns: bls, live_input_set
     // This pass consists of a liveness analysis and a reaching definition (for typing)
     fn set_input_output(
         &self,
@@ -2241,7 +2293,7 @@ impl<'ast> ZGen<'ast> {
         exit_bls_fn: &BTreeSet<usize>,
         call_exit_entry_map: &BTreeMap<usize, usize>,
         inputs: Vec<(String, Ty)>
-    ) -> (Vec<Block<'ast>>, Vec<bool>) {
+    ) -> (Vec<Block<'ast>>, BTreeSet<String>) {
         // Liveness
         let mut visited: Vec<bool> = vec![false; bls.len()];
         // MEET is union, so IN and OUT are Empty Set
@@ -2336,7 +2388,7 @@ impl<'ast> ZGen<'ast> {
                 }
 
                 // KILL and GEN within the block
-                (state, state_per_trace, _) = la_inst(state, state_per_trace, &bls[cur_bl].instructions);
+                (state, state_per_trace, _, _, _) = la_inst::<false>(state, state_per_trace, &bls[cur_bl].instructions);
 
                 bl_in[cur_bl] = state;
                 bl_in_per_call_trace[cur_bl] = state_per_trace.clone();
@@ -2437,19 +2489,17 @@ impl<'ast> ZGen<'ast> {
         // For entry block, inputs need to be sorted the same order as program input
         // Determine liveness of each program input along the way
         bls[*entry_bl].inputs = Vec::new();
-        let mut input_liveness = Vec::new();
+        let mut live_input_set = BTreeSet::new();
         for (name, _) in &inputs {
             if input_lst[*entry_bl].contains(name) {
-                input_liveness.push(true);
+                live_input_set.insert(name.to_string());
                 if let Some(ty) = ty_map_in[*entry_bl].get(name) {
                     bls[*entry_bl].inputs.push((name.to_string(), Some(ty.clone())));
                 }
-            } else {
-                input_liveness.push(false);
             }
         }
 
-        return (bls, input_liveness);
+        return (bls, live_input_set);
     }
 
     // Count number of constraints for a block
@@ -3382,7 +3432,8 @@ impl<'ast> ZGen<'ast> {
         bls: Vec<Block<'ast>>,
         entry_bl: usize,
         VERBOSE: bool,
-    ) -> (Vec<Block<'ast>>, usize, usize, usize, Vec<(Vec<usize>, Vec<usize>)>, Vec<(usize, usize)>, Vec<Vec<usize>>) {
+        // inputs: Vec<(String, Ty)>,
+    ) -> (Vec<Block<'ast>>, usize, usize, usize, Vec<(Vec<usize>, Vec<usize>)>, Vec<(usize, usize)>, Vec<Vec<usize>>) { //, Vec<usize>) {
         println!("\n\n--\nPost-Processing:");
         // Construct a new CFG for the program
         // Note that this is the CFG after DBE, and might be different from the previous CFG
@@ -3427,6 +3478,7 @@ impl<'ast> ZGen<'ast> {
                 println!("  BLOCK {}: {:?}", i, live_io[i])
             }
         }
+        // let input_indices = inputs.
 
         // Convert Typed Defs back to Assignees
         let bls = self.tydef_to_assignee::<MODE>(bls);
