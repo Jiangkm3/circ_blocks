@@ -6,7 +6,6 @@
 use std::collections::VecDeque;
 use zokrates_pest_ast::*;
 use crate::front::zsharp::blocks::*;
-use crate::front::zsharp::pretty::pretty_block_content;
 use std::collections::{BTreeMap, BTreeSet};
 use crate::front::zsharp::Ty;
 use itertools::Itertools;
@@ -1162,7 +1161,8 @@ fn la_inst<'ast, const ELIM: bool>(
     mut state: BTreeSet<String>,
     // One live variable set per each function call trace, expressed as a BTreeMap
     mut state_per_call_trace: BTreeMap<Vec<usize>, BTreeSet<String>>,
-    inst: &Vec<BlockContent<'ast>>
+    inst: &Vec<BlockContent<'ast>>,
+    no_ro_accesses: bool,
 ) -> (
     BTreeSet<String>, BTreeMap<Vec<usize>, BTreeSet<String>>, Vec<BlockContent<'ast>>, 
     usize, usize // Number of RO and VM accesses
@@ -1208,6 +1208,7 @@ fn la_inst<'ast, const ELIM: bool>(
             // NOTE: Due to pointer aliasing, cannot remove any vm statements
             // If there is an array initialization, then the array is dead but %AS is alive
             BlockContent::ArrayInit((arr, _, len, read_only)) => {
+                let read_only = if no_ro_accesses { &false } else { &read_only };
                 // if is_alive(&state, arr) {
                     new_instructions.insert(0, i.clone());
                     let gen = expr_find_val(&len);
@@ -1231,6 +1232,7 @@ fn la_inst<'ast, const ELIM: bool>(
             }
             // If there is a store, then keep the statement if array is alive
             BlockContent::Store((val_expr, _, arr, id_expr, _, read_only)) => {
+                let read_only = if no_ro_accesses { &false } else { &read_only };
                 // if is_alive(&state, arr) {
                     new_instructions.insert(0, i.clone());
                     if *read_only {
@@ -1258,6 +1260,7 @@ fn la_inst<'ast, const ELIM: bool>(
             }
             // If there is a load, then keep the statement if val is alive
             BlockContent::Load((val, _, arr, id_expr, read_only)) => {
+                let read_only = if no_ro_accesses { &false } else { &read_only };
                 if is_alive(&state, val) {
                     new_instructions.insert(0, i.clone());
                     if *read_only {
@@ -1284,6 +1287,7 @@ fn la_inst<'ast, const ELIM: bool>(
             }
             // Do not reason about liveness of dummy loads, mark %TS as alive
             BlockContent::DummyLoad(read_only) => {
+                let read_only = if no_ro_accesses { &false } else { &read_only };
                 new_instructions.insert(0, i.clone());
                 if *read_only {
                     num_ro_ops += 1;
@@ -1302,9 +1306,9 @@ fn la_inst<'ast, const ELIM: bool>(
             BlockContent::Branch((cond, if_inst, else_inst)) => {
                 // Liveness of branches
                 let (mut new_if_state, mut new_if_state_per_call_trace, new_if_inst, left_ro_ops, left_vm_ops) = 
-                    la_inst::<ELIM>(state.clone(), state_per_call_trace.clone(), if_inst);
+                    la_inst::<ELIM>(state.clone(), state_per_call_trace.clone(), if_inst, no_ro_accesses);
                 let (new_else_state, new_else_state_per_call_trace, new_else_inst, right_ro_ops, right_vm_ops) = 
-                    la_inst::<ELIM>(state.clone(), state_per_call_trace.clone(), else_inst);
+                    la_inst::<ELIM>(state.clone(), state_per_call_trace.clone(), else_inst, no_ro_accesses);
                 new_if_state.extend(new_else_state);
                 assert_eq!(new_if_state_per_call_trace.len(), new_else_state_per_call_trace.len());
                 for (entry_point, _) in new_if_state_per_call_trace.clone() {
@@ -1573,6 +1577,7 @@ fn tta_inst<'ast, const IN_BRANCH: bool>(
 // Block Memory Counter
 fn bmc_inst<'ast>(
     inst: &Vec<BlockContent<'ast>>,
+    no_ro_accesses: bool,
 ) -> (usize, usize, Vec<bool>) {
     let mut phy_mem_accesses_count = 0;
     let mut vir_mem_accesses_count = 0;
@@ -1591,7 +1596,7 @@ fn bmc_inst<'ast>(
             BlockContent::ArrayInit(_) => {}
             // Store includes init, invalidate, & store
             BlockContent::Store((_, _, _, _, _, ro)) => {
-                if *ro {
+                if !no_ro_accesses && *ro {
                     phy_mem_accesses_count += 1;
                 } else {
                     vir_mem_accesses_count += 1;
@@ -1600,7 +1605,7 @@ fn bmc_inst<'ast>(
                 }
             }
             BlockContent::Load((_, _, _, _, ro)) => {
-                if *ro {
+                if !no_ro_accesses && *ro {
                     phy_mem_accesses_count += 1;
                 } else {
                     vir_mem_accesses_count += 1;
@@ -1609,7 +1614,7 @@ fn bmc_inst<'ast>(
                 }
             }
             BlockContent::DummyLoad(ro) => {
-                if *ro {
+                if !no_ro_accesses && *ro {
                     phy_mem_accesses_count += 1;
                 } else {
                     vir_mem_accesses_count += 1;
@@ -1640,8 +1645,8 @@ fn bmc_inst<'ast>(
             }
             */
             BlockContent::Branch((_, if_inst, else_inst)) => {
-                let (if_phy_mem_accesses_count, if_vir_mem_accesses_count, if_vm_liveness) = bmc_inst(&if_inst);
-                let (else_phy_mem_accesses_count, else_vir_mem_accesses_count, else_vm_liveness) = bmc_inst(&else_inst);
+                let (if_phy_mem_accesses_count, if_vir_mem_accesses_count, if_vm_liveness) = bmc_inst(&if_inst, no_ro_accesses);
+                let (else_phy_mem_accesses_count, else_vir_mem_accesses_count, else_vm_liveness) = bmc_inst(&else_inst, no_ro_accesses);
                 // Through dummy loads, ro ops of both branches should be the same
                 assert_eq!(if_phy_mem_accesses_count, else_phy_mem_accesses_count);
                 // Through dummy loads, mem ops of both branches should be the same
@@ -1688,6 +1693,11 @@ impl VarSpillInfo {
     }
 }
 
+use crate::front::zsharp::NO_OPT;
+use crate::front::zsharp::OPT_BLOCK_MERGE;
+use crate::front::zsharp::OPT_SPILLING;
+use crate::front::zsharp::OPT_RO_ARRAYS;
+
 impl<'ast> ZGen<'ast> {
     // --
     // BLOCK OPTIMIZATION
@@ -1700,8 +1710,12 @@ impl<'ast> ZGen<'ast> {
         mut bls: Vec<Block<'ast>>,
         mut entry_bl: usize,
         mut inputs: Vec<(String, Ty)>,
-        // When no_opt is set, DO NOT perform Merge / Spilling
-        no_opt: bool,
+        // Opt Level is set as:
+        // 0 - No Opt
+        // 1 - + Block Merge
+        // 2 - + Register Spilling
+        // 3 - + Read-only Arrays
+        opt_level: usize,
         VERBOSE: bool,
     ) -> (Vec<Block<'ast>>, usize, BTreeSet<String>) {
         println!("\n\n--\nOptimization:");
@@ -1709,7 +1723,8 @@ impl<'ast> ZGen<'ast> {
         inputs.insert(0, ("%AS".to_string(), Ty::Field));
         inputs.insert(0, ("%SP".to_string(), Ty::Field));
 
-        if !no_opt {
+        let no_ro_accesses = opt_level < OPT_RO_ARRAYS;
+        if opt_level >= OPT_BLOCK_MERGE {
             // Construct CFG
             let (
                 successor, 
@@ -1745,7 +1760,7 @@ impl<'ast> ZGen<'ast> {
                 _
             ) = self.construct_flow_graph(&bls, entry_bl);
             // Liveness
-            bls = self.liveness_analysis(bls, &successor, &predecessor,  &predecessor_fn, &exit_bls);
+            bls = self.liveness_analysis(bls, &successor, &predecessor,  &predecessor_fn, &exit_bls, no_ro_accesses);
             // DBE
             (bls, entry_bl, _) = self.dead_block_elimination(bls, entry_bl, predecessor);
             if VERBOSE {
@@ -1770,14 +1785,14 @@ impl<'ast> ZGen<'ast> {
             }
 
             // Set Input Output
-            (bls, _) = self.set_input_output(bls, &successor, &predecessor, &predecessor_fn, &entry_bl, &exit_bls, &entry_bls_fn, &exit_bls_fn, &call_exit_entry_map, inputs.clone());
+            (bls, _) = self.set_input_output(bls, &successor, &predecessor, &predecessor_fn, &entry_bl, &exit_bls, &entry_bls_fn, &exit_bls_fn, &call_exit_entry_map, inputs.clone(), no_ro_accesses);
             if VERBOSE {
                 println!("\n\n--\nSet Input Output before Spilling:");
                 print_bls(&bls, &entry_bl);
             }
 
             // Resolve block merge
-            bls = self.resolve_block_merge(bls, &successor, &successor_fn, &predecessor_fn, &exit_bls_fn);
+            bls = self.resolve_block_merge(bls, &successor, &successor_fn, &predecessor_fn, &exit_bls_fn, no_ro_accesses);
             // Reconstruct CFG
             let (
                 successor, 
@@ -1800,31 +1815,33 @@ impl<'ast> ZGen<'ast> {
                 print_bls(&bls, &entry_bl);
             }
 
-            // Reconstruct CFG
-            let (
-                successor, 
-                predecessor, 
-                exit_bls, 
-                entry_bls_fn, 
-                successor_fn, 
-                predecessor_fn, 
-                exit_bls_fn,
-                _,
-                _
-            ) = self.construct_flow_graph(&bls, entry_bl);
-            if VERBOSE && CFG_VERBOSE {
-                print_cfg(&successor, &predecessor, &exit_bls, &entry_bls_fn, &successor_fn, &predecessor_fn, &exit_bls_fn);
-            }
+            if opt_level >= OPT_SPILLING {
+                // Reconstruct CFG
+                let (
+                    successor, 
+                    predecessor, 
+                    exit_bls, 
+                    entry_bls_fn, 
+                    successor_fn, 
+                    predecessor_fn, 
+                    exit_bls_fn,
+                    _,
+                    _
+                ) = self.construct_flow_graph(&bls, entry_bl);
+                if VERBOSE && CFG_VERBOSE {
+                    print_cfg(&successor, &predecessor, &exit_bls, &entry_bls_fn, &successor_fn, &predecessor_fn, &exit_bls_fn);
+                }
 
-            // Spilling
-            // Obtain io_size = maximum # of variables in a transition state that belong to the current function & have different names
-            // Note that this value is not the final io_size as it does not include any reserved registers
-            let tmp_io_size = self.get_max_io_size(&bls, &inputs);
-            // Perform spilling
-            bls = self.resolve_spilling(bls, tmp_io_size, &predecessor, &successor, entry_bl, &entry_bls_fn, &predecessor_fn, &successor_fn);
-            if VERBOSE {
-                println!("\n\n--\nSpilling:");
-                print_bls(&bls, &entry_bl);
+                // Spilling
+                // Obtain io_size = maximum # of variables in a transition state that belong to the current function & have different names
+                // Note that this value is not the final io_size as it does not include any reserved registers
+                let tmp_io_size = self.get_max_io_size(&bls, &inputs);
+                // Perform spilling
+                bls = self.resolve_spilling(bls, tmp_io_size, &predecessor, &successor, entry_bl, &entry_bls_fn, &predecessor_fn, &successor_fn);
+                if VERBOSE {
+                    println!("\n\n--\nSpilling:");
+                    print_bls(&bls, &entry_bl);
+                }
             }
         }
 
@@ -1845,7 +1862,7 @@ impl<'ast> ZGen<'ast> {
         }
 
         // Liveness, mainly to remove %BP
-        bls = self.liveness_analysis(bls, &successor, &predecessor,  &predecessor_fn, &exit_bls);
+        bls = self.liveness_analysis(bls, &successor, &predecessor,  &predecessor_fn, &exit_bls, no_ro_accesses);
         // EBE
         (_, predecessor, bls) = self.empty_block_elimination(bls, exit_bls, successor, predecessor, &entry_bls_fn, &exit_bls_fn);
         // DBE
@@ -1873,7 +1890,7 @@ impl<'ast> ZGen<'ast> {
 
         // Set I/O again after optimizations
         let live_input_set: BTreeSet<String>;
-        (bls, live_input_set) = self.set_input_output(bls, &successor, &predecessor, &predecessor_fn, &entry_bl, &exit_bls, &entry_bls_fn, &exit_bls_fn, &call_exit_entry_map, inputs.clone());
+        (bls, live_input_set) = self.set_input_output(bls, &successor, &predecessor, &predecessor_fn, &entry_bl, &exit_bls, &entry_bls_fn, &exit_bls_fn, &call_exit_entry_map, inputs.clone(), no_ro_accesses);
         if VERBOSE {
             println!("\n\n--\nSet Input Output after Spilling:");
             print_bls(&bls, &entry_bl);
@@ -2072,6 +2089,7 @@ impl<'ast> ZGen<'ast> {
         predecessor: &Vec<BTreeSet<usize>>,
         predecessor_fn: &Vec<BTreeSet<usize>>,
         exit_bls: &BTreeSet<usize>,
+        no_ro_accesses: bool,
     ) -> Vec<Block<'ast>> {
         let mut visited: Vec<bool> = vec![false; bls.len()];
         // MEET is union, so IN and OUT are Empty Set
@@ -2118,7 +2136,7 @@ impl<'ast> ZGen<'ast> {
                 // KILL and GEN within the block
                 // We do not need to worry about state_per_trace in liveness analysis
                 // Only useful in set_input_output
-                (state, _, _, _, _) = la_inst::<false>(state, BTreeMap::new(), &bls[cur_bl].instructions);
+                (state, _, _, _, _) = la_inst::<false>(state, BTreeMap::new(), &bls[cur_bl].instructions, no_ro_accesses);
                 bl_in[cur_bl] = state;
 
                 // Block Transition
@@ -2162,7 +2180,7 @@ impl<'ast> ZGen<'ast> {
 
                 let num_ro_ops: usize;
                 let num_vm_ops: usize;
-                (_, _, new_instructions, num_ro_ops, num_vm_ops) = la_inst::<true>(state, BTreeMap::new(), &bls[cur_bl].instructions);
+                (_, _, new_instructions, num_ro_ops, num_vm_ops) = la_inst::<true>(state, BTreeMap::new(), &bls[cur_bl].instructions, no_ro_accesses);
                 bls[cur_bl].instructions = new_instructions;
                 bls[cur_bl].num_ro_ops = num_ro_ops;
                 bls[cur_bl].num_vm_ops = num_vm_ops;
@@ -2292,7 +2310,8 @@ impl<'ast> ZGen<'ast> {
         entry_bls_fn: &BTreeSet<usize>,
         exit_bls_fn: &BTreeSet<usize>,
         call_exit_entry_map: &BTreeMap<usize, usize>,
-        inputs: Vec<(String, Ty)>
+        inputs: Vec<(String, Ty)>,
+        no_ro_accesses: bool,
     ) -> (Vec<Block<'ast>>, BTreeSet<String>) {
         // Liveness
         let mut visited: Vec<bool> = vec![false; bls.len()];
@@ -2388,7 +2407,7 @@ impl<'ast> ZGen<'ast> {
                 }
 
                 // KILL and GEN within the block
-                (state, state_per_trace, _, _, _) = la_inst::<false>(state, state_per_trace, &bls[cur_bl].instructions);
+                (state, state_per_trace, _, _, _) = la_inst::<false>(state, state_per_trace, &bls[cur_bl].instructions, no_ro_accesses);
 
                 bl_in[cur_bl] = state;
                 bl_in_per_call_trace[cur_bl] = state_per_trace.clone();
@@ -2505,11 +2524,12 @@ impl<'ast> ZGen<'ast> {
     // Count number of constraints for a block
     fn bl_count_num_cons(
         &self,
-        bl: &Block<'ast>
+        bl: &Block<'ast>,
+        no_ro_accesses: bool,
     ) -> usize {
         let block_name = &format!("Pseudo_Block_{}", bl.name);
         self.circ_init_block(block_name);
-        self.bl_to_circ::<true>(bl, block_name);
+        self.bl_to_circ::<true>(bl, block_name, no_ro_accesses);
 
         let mut cs = Computations::new();
         cs.comps = self.circ.borrow().cir_ctx().cs.borrow_mut().clone();
@@ -2533,12 +2553,13 @@ impl<'ast> ZGen<'ast> {
         successor: &Vec<BTreeSet<usize>>,
         successor_fn: &Vec<BTreeSet<usize>>,
         predecessor_fn: &Vec<BTreeSet<usize>>,
-        exit_bls_fn: &BTreeSet<usize>
+        exit_bls_fn: &BTreeSet<usize>,
+        no_ro_accesses: bool,
     ) -> Vec<Block<'ast>> {
         // STEP 1: Obtain number of constraints for all blocks
         let mut bl_num_cons = Vec::new();
         for b in &bls {
-            bl_num_cons.push(self.bl_count_num_cons(b));
+            bl_num_cons.push(self.bl_count_num_cons(b, no_ro_accesses));
         }
         // Reset self.circ
         self.circ.borrow_mut().reset(ZSharp::new());
@@ -3431,6 +3452,7 @@ impl<'ast> ZGen<'ast> {
         &self,
         bls: Vec<Block<'ast>>,
         entry_bl: usize,
+        opt_level: usize,
         VERBOSE: bool,
         // inputs: Vec<(String, Ty)>,
     ) -> (Vec<Block<'ast>>, usize, usize, usize, Vec<(Vec<usize>, Vec<usize>)>, Vec<(usize, usize)>, Vec<Vec<usize>>) { //, Vec<usize>) {
@@ -3488,7 +3510,7 @@ impl<'ast> ZGen<'ast> {
         }
 
         // Obtain # of scoping memory accesses per block
-        let (num_mem_accesses, live_vm) = self.get_blocks_memory_info(&bls);
+        let (num_mem_accesses, live_vm) = self.get_blocks_memory_info(&bls, opt_level < OPT_RO_ARRAYS);
 
         print_bls(&bls, &entry_bl);
         (bls, entry_bl, io_size, witness_size, live_io, num_mem_accesses, live_vm)
@@ -3872,13 +3894,14 @@ impl<'ast> ZGen<'ast> {
     fn get_blocks_memory_info(
         &self,
         bls: &Vec<Block>,
+        no_ro_accesses: bool,
     ) -> (Vec<(usize, usize)>, Vec<Vec<usize>>) {
         // Number of memory accesses per block
         let mut num_mem_accesses = Vec::new();
         // Map of each _live_ vm variables to its overall ordering
         let mut live_vm_list = Vec::new();
         for b in bls {
-            let (phy_mem_accesses_count, vir_mem_accesses_count, vm_liveness) = bmc_inst(&b.instructions);
+            let (phy_mem_accesses_count, vir_mem_accesses_count, vm_liveness) = bmc_inst(&b.instructions, no_ro_accesses);
             num_mem_accesses.push((phy_mem_accesses_count, vir_mem_accesses_count));
             let mut live_vm = Vec::new();
             for i in 0..vm_liveness.len() {

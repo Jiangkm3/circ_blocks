@@ -16,6 +16,7 @@ use crate::front::zsharp::ZGen;
 use crate::front::zsharp::Ty;
 use crate::front::zsharp::PathBuf;
 use crate::front::zsharp::pretty::*;
+use core::cmp::max;
 use std::collections::{HashMap, BTreeMap, BTreeSet};
 use std::convert::TryInto;
 use crate::front::zsharp::*;
@@ -1057,7 +1058,8 @@ impl<'ast> ZGen<'ast> {
                         cnst_for_loop = false;
                         0
                     };
-                    if !cnst_for_loop { (1, cnst_for_loop) } else { (to_const - from_const, cnst_for_loop) }
+                    // TODO: temporary hack to avoid block with 0 executions
+                    if !cnst_for_loop { (1, cnst_for_loop) } else { (max(1, to_const - from_const), cnst_for_loop) }
                 };
 
                 // Create and push FROM statement
@@ -2191,11 +2193,11 @@ impl<'ast> ZGen<'ast> {
     }
 
     // Convert a list of blocks to circ_ir
-    pub fn bls_to_circ(&'ast self, blks: &Vec<Block>) {
+    pub fn bls_to_circ(&'ast self, blks: &Vec<Block>, no_ro_accesses: bool) {
         for b in blks {
             let f = &format!("Block_{}", b.name);
             self.circ_init_block(f);
-            self.bl_to_circ::<false>(&b, f);
+            self.bl_to_circ::<false>(&b, f, no_ro_accesses);
         }
     }
 
@@ -2286,6 +2288,7 @@ impl<'ast> ZGen<'ast> {
         mut phy_mem_op_count: usize,
         mut ro_mem_op_count: usize, 
         mut vir_mem_op_count: usize,
+        no_ro_accesses: bool,
     ) -> (usize, usize, usize, usize) {
         debug!("Inst to Circ: {:?}", i);
         match i {
@@ -2315,6 +2318,7 @@ impl<'ast> ZGen<'ast> {
                     wit_count += 1;
                 }
             }
+            // Push and pop are not affected by no_ro_accesses
             BlockContent::MemPush((var, _, offset)) => {
                 // Non-deterministically supply ADDR
                 self.circ_declare_input(
@@ -2440,6 +2444,7 @@ impl<'ast> ZGen<'ast> {
                 phy_mem_op_count += 1;  
             }
             BlockContent::ArrayInit((arr, _, len_expr, read_only)) => {
+                let read_only = if no_ro_accesses { &false } else { read_only };
                 if ESTIMATE {
                     self.circ_declare_input(
                         &f,
@@ -2474,6 +2479,7 @@ impl<'ast> ZGen<'ast> {
                 }
             }
             BlockContent::Store((val_expr, _, arr, id_expr, init, read_only)) => {
+                let read_only = if no_ro_accesses { &false } else { read_only };
                 if ESTIMATE {}
                 else {
                     let rhs_t = if *read_only {
@@ -2527,6 +2533,7 @@ impl<'ast> ZGen<'ast> {
                 }
             }
             BlockContent::Load((val, ty, arr, id_expr, read_only)) => {
+                let read_only = if no_ro_accesses { &false } else { read_only };
                 if ESTIMATE {
                     let r = self.circ_declare_input(
                         &f,
@@ -2580,6 +2587,7 @@ impl<'ast> ZGen<'ast> {
                 }
             }
             BlockContent::DummyLoad(read_only) => {
+                let read_only = if no_ro_accesses { &false } else { read_only };
                 // ADDR, LS, & TS
                 self.vir_mem_to_circ::<DUMMY_LOAD>(
                     if *read_only { ro_mem_op_count } else { vir_mem_op_count },
@@ -2609,12 +2617,12 @@ impl<'ast> ZGen<'ast> {
 
                 self.circ_enter_condition(cbool.clone());
                 for i in if_insts {
-                    (if_wit_count, if_phy_mem_op_count, if_ro_mem_op_count, if_vir_mem_op_count) = self.inst_to_circ::<ESTIMATE>(i, f, wit_count, if_phy_mem_op_count, if_ro_mem_op_count, if_vir_mem_op_count);
+                    (if_wit_count, if_phy_mem_op_count, if_ro_mem_op_count, if_vir_mem_op_count) = self.inst_to_circ::<ESTIMATE>(i, f, wit_count, if_phy_mem_op_count, if_ro_mem_op_count, if_vir_mem_op_count, no_ro_accesses);
                 }
                 self.circ_exit_condition();
                 self.circ_enter_condition(term![NOT; cbool]);
                 for i in else_insts {
-                    (else_wit_count, else_phy_mem_op_count, else_ro_mem_op_count, else_vir_mem_op_count) = self.inst_to_circ::<ESTIMATE>(i, f, wit_count, else_phy_mem_op_count, else_ro_mem_op_count, else_vir_mem_op_count);
+                    (else_wit_count, else_phy_mem_op_count, else_ro_mem_op_count, else_vir_mem_op_count) = self.inst_to_circ::<ESTIMATE>(i, f, wit_count, else_phy_mem_op_count, else_ro_mem_op_count, else_vir_mem_op_count, no_ro_accesses);
                 }
                 self.circ_exit_condition();
 
@@ -2641,7 +2649,7 @@ impl<'ast> ZGen<'ast> {
     // Convert a block to circ_ir
     // This can be done to either produce the constraints, or to estimate the size of constraints
     // In estimation mode, we rename all output variable from X -> oX, add assertion, and process the terminator
-    pub fn bl_to_circ<const ESTIMATE: bool>(&self, b: &Block, f: &str) {
+    pub fn bl_to_circ<const ESTIMATE: bool>(&self, b: &Block, f: &str, no_ro_accesses: bool) {
         debug!("Bl to Circ: {}", b.name);
 
         // setup stack frame for entry function
@@ -2684,17 +2692,20 @@ impl<'ast> ZGen<'ast> {
             }
         }
 
+        // if no_ro_accesses, every array uses virtual memory
+        let num_ro_ops = if no_ro_accesses { 0 } else { b.num_ro_ops };
+        let num_vm_ops = if no_ro_accesses { b.num_ro_ops + b.num_vm_ops } else { b.num_vm_ops };
         // How many witnesses have we encountered?
         let mut wit_count = 0;
         // How many scoping memory operations have we encountered? Counter starts at b.num_ro_ops
-        let mut phy_mem_op_count = b.num_ro_ops;
+        let mut phy_mem_op_count = num_ro_ops;
         // How many read-only memory operations have we encountered?
         let mut ro_mem_op_count = 0;
         // How many virtual memory operations have we encountered?
         let mut vir_mem_op_count = 0;
         
         // Declare all read-only memory accesses to avoid dealing with branching
-        for i in 0..b.num_ro_ops {
+        for i in 0..num_ro_ops {
             // Declare the next ADDR and DATA
             // VIR_ADDR as 'a'
             self.circ_declare_input(
@@ -2718,7 +2729,7 @@ impl<'ast> ZGen<'ast> {
             ).unwrap();
         }
         // Declare all virtual memory accesses to avoid dealing with branching
-        for i in 0..b.num_vm_ops {
+        for i in 0..num_vm_ops {
             // Declare the next ADDR, DATA, L/S, and TS
             // VIR_ADDR as 'a'
             self.circ_declare_input(
@@ -2764,7 +2775,8 @@ impl<'ast> ZGen<'ast> {
 
         // Iterate over instructions, convert memory accesses into statements and then IR
         for i in &b.instructions {
-            (wit_count, phy_mem_op_count, ro_mem_op_count, vir_mem_op_count) = self.inst_to_circ::<ESTIMATE>(i, f, wit_count, phy_mem_op_count, ro_mem_op_count, vir_mem_op_count);
+            (wit_count, phy_mem_op_count, ro_mem_op_count, vir_mem_op_count) = 
+                self.inst_to_circ::<ESTIMATE>(i, f, wit_count, phy_mem_op_count, ro_mem_op_count, vir_mem_op_count, no_ro_accesses);
         }
         
         // If in estimation mode, declare and assert all outputs of the block

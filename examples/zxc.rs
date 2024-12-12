@@ -89,9 +89,9 @@ struct Options {
     /// quiet mode: don't print R1CS at the end
     quiet: bool,
 
-    #[arg(long = "no_opt")]
-    /// skip all block-level optimizations
-    no_opt: bool,
+    #[arg(long = "opt_level", default_value_t = 3)]
+    /// level of optimizations
+    opt_level: usize,
 
     #[arg(long = "verbose_opt")]
     /// print results of every optimization pass
@@ -545,7 +545,7 @@ fn get_compile_time_knowledge<const VERBOSE: bool>(
         let inputs = zsharp::Inputs {
             file: path.clone(),
             mode: Mode::Proof,
-            no_opt: options.no_opt,
+            opt_level: options.opt_level,
             verbose_opt: options.verbose_opt
         };
         ZSharpFE::gen(inputs)
@@ -807,7 +807,7 @@ fn get_run_time_knowledge<const VERBOSE: bool>(
         let inputs = zsharp::Inputs {
             file: path,
             mode: Mode::Proof,
-            no_opt: options.no_opt,
+            opt_level: options.opt_level,
             verbose_opt: options.verbose_opt
         };
 

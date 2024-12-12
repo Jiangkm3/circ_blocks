@@ -80,6 +80,7 @@ r1cs = ["bincode", "rayon"]
 poly = ["rug-polynomial"]
 spartan = ["r1cs", "dep:spartan", "curve25519-dalek", "bincode", "gmp-mpfr-sys"]
 bellman = ["r1cs", "dep:bellman", "ff", "group", "pairing", "serde_bytes", "bincode", "gmp-mpfr-sys", "byteorder", "rayon"]
+gmp-mpfr-sys = ["dep:gmp-mpfr-sys"]
 
 [[example]]
 name = "circ"

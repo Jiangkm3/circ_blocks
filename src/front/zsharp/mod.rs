@@ -41,14 +41,23 @@ pub struct Inputs {
     pub file: PathBuf,
     /// The mode to generate for (MPC or proof). Effects visibility.
     pub mode: Mode,
-    /// If true, do not perform block-level optimizations
-    pub no_opt: bool,
+    // Opt Level is set as:
+    // 0 - No Opt
+    // 1 - + Block Merge
+    // 2 - + Register Spilling
+    // 3 - + Read-only Arrays
+    pub opt_level: usize,
     /// Print results of every optimization pass
     pub verbose_opt: bool,
 }
 
 /// The Z# front-end. Implements [FrontEnd].
 pub struct ZSharpFE;
+
+pub const NO_OPT: usize = 0;
+pub const OPT_BLOCK_MERGE: usize = 1;
+pub const OPT_SPILLING: usize = 2;
+pub const OPT_RO_ARRAYS: usize = 3;
 
 impl FrontEnd for ZSharpFE {
     type Inputs<'ast> = Inputs;
@@ -70,14 +79,14 @@ impl FrontEnd for ZSharpFE {
             b.pretty();
             println!("");
         }
-        let (blks, entry_bl, live_input_set) = g.optimize_block(blks, entry_bl, inputs.clone(), i.no_opt, i.verbose_opt);
+        let (blks, entry_bl, live_input_set) = g.optimize_block(blks, entry_bl, inputs.clone(), i.opt_level, i.verbose_opt);
         let input_liveness = [vec![("%SP".to_string(), Ty::Field), ("%AS".to_string(), Ty::Field)], inputs].concat().iter().map(|(n, _)| live_input_set.contains(n)).collect();
         let (blks, _, io_size, _, live_io_list, num_mem_accesses, live_vm_list) = 
-            g.process_block::<0>(blks, entry_bl, i.verbose_opt);
+            g.process_block::<0>(blks, entry_bl, i.opt_level, i.verbose_opt);
         // NOTE: The input of block 0 includes %BN, which should be removed when reasoning about function input
         let func_input_width = blks[0].get_num_inputs() - 1;
         println!("\n\n--\nCirc IR:");
-        g.bls_to_circ(&blks);
+        g.bls_to_circ(&blks, i.opt_level < OPT_RO_ARRAYS);
 
         g.generics_stack_pop();
         g.file_stack_pop();
@@ -114,8 +123,8 @@ impl ZSharpFE {
         g.generics_stack_push(HashMap::new());
         
         let (blks, entry_bl, inputs) = g.bl_gen_entry_fn("main");
-        let (blks, entry_bl, mut live_input_set) = g.optimize_block(blks, entry_bl, inputs.clone(), i.no_opt, INTERPRET_VERBOSE);
-        let (blks, entry_bl, io_size, _, _, _, _) = g.process_block::<1>(blks, entry_bl, INTERPRET_VERBOSE);
+        let (blks, entry_bl, mut live_input_set) = g.optimize_block(blks, entry_bl, inputs.clone(), i.opt_level, INTERPRET_VERBOSE);
+        let (blks, entry_bl, io_size, _, _, _, _) = g.process_block::<1>(blks, entry_bl, i.opt_level, INTERPRET_VERBOSE);
 
         println!("\n\n--\nInterpretation:");
         let (
@@ -136,7 +145,8 @@ impl ZSharpFE {
             entry_arrays,
             entry_witnesses,
             &blks, 
-            io_size
+            io_size,
+            i.opt_level < OPT_RO_ARRAYS,
         )
             .unwrap_or_else(|e| panic!("const_entry_fn failed: {}", e));
         // prover::print_state_list(&bl_exec_state);

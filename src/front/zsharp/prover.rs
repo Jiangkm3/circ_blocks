@@ -240,7 +240,8 @@ impl<'ast> ZGen<'ast> {
         entry_arrays: &BTreeMap<String, Vec<Integer>>,
         entry_witnesses: &Vec<Integer>,
         bls: &Vec<Block<'ast>>,
-        io_size: usize
+        io_size: usize,
+        no_ro_accesses: bool,
     ) -> Result<(
         T, // Return value
         Vec<usize>, // Block ID
@@ -475,7 +476,7 @@ impl<'ast> ZGen<'ast> {
             let vir_mem_op: Vec<MemOp>;
             let wit_op: Vec<T>;
             (nb, terminated, phy_mem_op, vir_mem_op, wit_op, witness_count) = 
-                self.bl_eval_impl_(&bls[nb], &mut io_regs, &mut wit_regs, &mut phy_mem, &mut vir_mem, entry_witnesses, witness_count)?;
+                self.bl_eval_impl_(&bls[nb], &mut io_regs, &mut wit_regs, &mut phy_mem, &mut vir_mem, entry_witnesses, witness_count, no_ro_accesses)?;
             // Remove undeclared %o registers
             let mut live_o_regs = vec![false; io_regs.len()];
             if bl_exec_state.len() > 1 {
@@ -528,6 +529,7 @@ impl<'ast> ZGen<'ast> {
         vir_mem: &mut Vec<Option<T>>,
         entry_witnesses: &Vec<Integer>,
         mut witness_count: usize,
+        no_ro_accesses: bool,
     ) -> Result<(usize, bool, Vec<MemOp>, Vec<MemOp>, Vec<T>, usize), String> {
         debug!("Block eval impl: {}", bl.name);
 
@@ -537,7 +539,7 @@ impl<'ast> ZGen<'ast> {
         let mut vir_mem_op: Vec<MemOp> = Vec::new();
         let mut wit_op: Vec<T> = Vec::new();
 
-        witness_count = self.bl_eval_inst_impl_(io_regs, wit_regs, &bl.instructions, phy_mem, vir_mem, &mut phy_mem_op, &mut ro_mem_op, &mut vir_mem_op, &mut wit_op, entry_witnesses, witness_count)?;
+        witness_count = self.bl_eval_inst_impl_(io_regs, wit_regs, &bl.instructions, phy_mem, vir_mem, &mut phy_mem_op, &mut ro_mem_op, &mut vir_mem_op, &mut wit_op, entry_witnesses, witness_count, no_ro_accesses)?;
         ro_mem_op.extend(phy_mem_op);
         let phy_mem_op = ro_mem_op;
 
@@ -566,19 +568,21 @@ impl<'ast> ZGen<'ast> {
         wit_op: &mut Vec<T>, 
         entry_witnesses: &Vec<Integer>,
         mut witness_count: usize,
+        no_ro_accesses: bool,
     ) -> Result<usize, String> {
         for s in inst {
             debug!("Block eval inst impl: {:?}", s);
             match s {
                 BlockContent::Witness((var, ty, alive)) => {
                     if *alive {
-                        let ty = if let Ty::Array(..) = ty { &Ty::Field } else { ty };
+                        let ty = if let Ty::Array(..) = ty { &Ty::Field } else { &ty };
                         let val = self.int_to_t(&entry_witnesses[witness_count], &ty)?;
                         self.bl_eval_assign_impl_(io_regs, wit_regs, var, val.clone())?;
                         wit_op.push(val);
                     }
                     witness_count += 1;
                 }
+                // Push and pop are unaffected by no_ro_accesses
                 BlockContent::MemPush((var, _, offset)) => {
                     let sp_t = self.bl_eval_identifier_impl_(io_regs, wit_regs, W_SP)?;
                     let sp = self.t_to_usize(sp_t)?;
@@ -611,6 +615,7 @@ impl<'ast> ZGen<'ast> {
                     phy_mem_op.push(MemOp::new_phy(bp + offset, self.usize_to_field(bp + offset)?, val_t));         
                 }
                 BlockContent::ArrayInit((arr, _, len_expr, read_only)) => {
+                    let read_only = if no_ro_accesses { &false } else { &read_only };
                     // Declare the array as a pointer (field), set to %SP or %AS
                     let pointer_t = if *read_only {
                         self.bl_eval_identifier_impl_(io_regs, wit_regs, W_SP)?
@@ -623,10 +628,16 @@ impl<'ast> ZGen<'ast> {
                     if len_t.type_() != &Ty::Field {
                         len_t = uint_to_field(len_t).unwrap();
                     }
-                    let new_pointer_t = add(pointer_t, len_t).unwrap();
+                    let new_pointer_t = add(pointer_t, len_t.clone()).unwrap();
                     self.bl_eval_assign_impl_(io_regs, wit_regs, if *read_only { W_SP } else { W_AS }, new_pointer_t)?;
+                    // If RO array, allocate space on PHY_MEM
+                    if *read_only {
+                        let len = self.t_to_usize(len_t)?;
+                        phy_mem.extend(vec![None; len]);
+                    }
                 }
                 BlockContent::Store((val_expr, ty, arr, id_expr, init, read_only)) => {
+                    let read_only = if no_ro_accesses { &false } else { &read_only };
                     let mut val_t = self.bl_eval_expr_impl_(io_regs, wit_regs, &val_expr)?;
                     let entry_ty = val_t.type_();
                     if ty != entry_ty {
@@ -702,6 +713,7 @@ impl<'ast> ZGen<'ast> {
                     }
                 }
                 BlockContent::Load((var, ty, arr, id_expr, read_only)) => {
+                    let read_only = if no_ro_accesses { &false } else { &read_only };
                     let mut id_t = self.bl_eval_expr_impl_(io_regs, wit_regs, &id_expr)?;
 
                     // Add array offset to obtain address
@@ -763,6 +775,7 @@ impl<'ast> ZGen<'ast> {
                     }
                 }
                 BlockContent::DummyLoad(read_only) => {
+                    let read_only = if no_ro_accesses { &false } else { &read_only };
                     // Addr is 0
                     let addr_t = self.bl_eval_expr_impl_(io_regs, wit_regs, &Expression::Literal(LiteralExpression::DecimalLiteral(DecimalLiteralExpression {
                         value: DecimalNumber {
@@ -824,10 +837,10 @@ impl<'ast> ZGen<'ast> {
                             .ok_or_else(|| "interpreting expr as const bool failed".to_string())
                     }) {
                         Ok(true) => {
-                            witness_count = self.bl_eval_inst_impl_(io_regs, wit_regs, if_inst, phy_mem, vir_mem, phy_mem_op, ro_mem_op, vir_mem_op, wit_op, entry_witnesses, witness_count)?;
+                            witness_count = self.bl_eval_inst_impl_(io_regs, wit_regs, if_inst, phy_mem, vir_mem, phy_mem_op, ro_mem_op, vir_mem_op, wit_op, entry_witnesses, witness_count, no_ro_accesses)?;
                         },
                         Ok(false) => {
-                            witness_count = self.bl_eval_inst_impl_(io_regs, wit_regs, else_inst, phy_mem, vir_mem, phy_mem_op, ro_mem_op, vir_mem_op, wit_op, entry_witnesses, witness_count)?;
+                            witness_count = self.bl_eval_inst_impl_(io_regs, wit_regs, else_inst, phy_mem, vir_mem, phy_mem_op, ro_mem_op, vir_mem_op, wit_op, entry_witnesses, witness_count, no_ro_accesses)?;
                         },
                         Err(err) => return Err(format!(
                             "Const conditional expression eval failed: {} at\n{}",
